@@ -574,6 +574,28 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
     <div id="fleet"></div>
 
     <div class="gh"><span class="k">Settings</span><i></i></div>
+    <details class="card" id="bus-card">
+      <summary><span class="k">BMS bus</span><span id="bus-sum"> </span></summary>
+      <p class="note">What this adapter puts the UPS on, for a building management system.
+        One protocol at a time &mdash; the trunk cannot carry two. The UPS data is read-only on
+        the bus: this device never accepts commands from it. Changes need a restart.</p>
+      <label for="bus-proto">Protocol</label>
+      <select id="bus-proto"></select>
+      <label for="bus-addr">Address <span class="note">(Modbus unit ID, or BACnet MS/TP MAC &mdash; 1 to 127)</span></label>
+      <input id="bus-addr" inputmode="numeric" autocomplete="off">
+      <label for="bus-baud">Baud</label>
+      <select id="bus-baud">
+        <option value="0">auto</option>
+        <option value="9600">9600</option>
+        <option value="19200">19200</option>
+        <option value="38400">38400</option>
+        <option value="57600">57600</option>
+        <option value="76800">76800</option>
+        <option value="115200">115200</option>
+      </select>
+      <button class="btn" id="bus-save">Save</button>
+      <p class="note" id="bus-stat"></p>
+    </details>
     <details class="card" id="auth-card">
       <summary><span class="k">Login</span><span id="auth-sum"> </span></summary>
       <p class="note" id="pw-default" hidden><b>This board still has its built-in default
@@ -1757,6 +1779,7 @@ async function poll(){
     const setup=w.state===PROVISIONING && s.setup_screen!==false, card=$('wifi-card');
     card.hidden=!!w.wired;      // a board on a cable has no Wi-Fi to show
     authUI(s.auth||{}, setup);
+    busUI(s.bus||{});
     if(document.body.classList.contains('setup')!==setup){
       document.body.classList.toggle('setup',setup);
       if(setup) document.querySelector('.hdr').after(card);
@@ -2098,6 +2121,42 @@ if($('fwup-go')) $('fwup-go').onclick=async()=>{
   }catch(e){ st.textContent='the upload did not complete'; toast('Upload failed'); }
   b.disabled=false;
 };
+// The BMS bus card. The IP protocols are offered only when the board has
+// actually joined a network -- asking the network, not the board type, is
+// what lets an RS485 board serve Modbus TCP over Wi-Fi at the one site that
+// wants it.
+let busBuilt=null;
+function busUI(b){
+  const key=JSON.stringify([b.rs485,b.ip,b.proto,b.address,b.baud]);
+  if(busBuilt!==key){
+    busBuilt=key;
+    const opts=[[0,'none (nothing on the bus)']];
+    if(b.rs485){ opts.push([1,'Modbus RTU (RS485)']); opts.push([2,'BACnet MS/TP (RS485)']); }
+    if(b.ip){ opts.push([3,'Modbus TCP']); opts.push([4,'BACnet/IP']); }
+    $('bus-proto').innerHTML=opts.map(o=>`<option value="${o[0]}">${esc(o[1])}</option>`).join('');
+    $('bus-proto').value=String(b.proto||0);
+    $('bus-addr').value=b.address||4;
+    $('bus-baud').value=String(b.baud===undefined?0:b.baud);
+  }
+  const names=['none','Modbus RTU','BACnet MS/TP','Modbus TCP','BACnet/IP'];
+  $('bus-sum').textContent = b.proto ? `${names[b.proto]} · address ${b.address}` : 'nothing selected';
+  let st;
+  if(!b.proto) st='Nothing is being served. Pick a protocol and restart.';
+  else if(!b.running) st=`${names[b.proto]} is selected but not running — restart to apply.`;
+  else if(b.quiet_s<0) st=`Running at ${b.baud||'auto'} baud. Nothing has polled this device yet.`;
+  else st=`Running at ${b.baud} baud · ${b.requests} request${b.requests===1?'':'s'} · last ${b.quiet_s}s ago`
+         + (b.writes?` · ${b.writes} write${b.writes===1?'':'s'} refused`:'');
+  if(!b.ip) st+=' The IP protocols appear once this board has joined a network.';
+  $('bus-stat').textContent=st;
+}
+$('bus-save').onclick=async()=>{
+  const r=await api('/api/bus',{proto:+$('bus-proto').value,
+                                address:+$('bus-addr').value,
+                                baud:+$('bus-baud').value});
+  if(!r.ok){ toast(r.error||'failed'); return; }
+  busBuilt=null; toast('Saved — restart to apply'); poll();
+};
+
 // The Login card: change the login, or log out. It cannot be turned off.
 let authBuilt=null;
 function authUI(a,setup){

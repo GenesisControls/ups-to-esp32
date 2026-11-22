@@ -16,6 +16,8 @@
 #include "snmp.h"
 #include "ota.h"
 #include "auth.h"
+#include "out_common.h"
+#include "out_modbus.h"
 #include "mbedtls/base64.h"
 #include "nvs.h"
 #include "board.h"
@@ -348,6 +350,27 @@ static esp_err_t get_status(httpd_req_t *req)
 #else
                   "false");
 #endif
+
+    /* The BMS bus. "ip" is what decides whether the page offers Modbus TCP
+     * and BACnet/IP at all: they need an interface with an address, and the
+     * answer is the network's, not the board type's -- an RS485 board that
+     * joined a Wi-Fi can serve them perfectly well. */
+    {
+        out_modbus_stat_t mb;
+        out_modbus_get(&mb);
+        n += snprintf(AT(n), ROOM(n),
+                  ",\"bus\":{\"proto\":%d,\"address\":%d,\"baud\":%d,"
+                  "\"rs485\":%s,\"ip\":%s,\"running\":%s,"
+                  "\"requests\":%u,\"writes\":%u,\"quiet_s\":%lld}",
+                  (int)out_common_proto(), out_common_address(), out_common_baud(),
+                  BOARD_HAS_RS485 ? "true" : "false",
+                  netmgr_state() == NETMGR_STA_CONNECTED ? "true" : "false",
+                  mb.running ? "true" : "false",
+                  (unsigned)mb.requests, (unsigned)mb.writes_refused,
+                  mb.last_request_us
+                      ? (long long)((esp_timer_get_time() - mb.last_request_us) / 1000000)
+                      : -1LL);
+    }
 #if CONFIG_UPSA_TAILSCALE
     /* Present only in a Tailscale build, so the page can tell "not in this
      * firmware" from "off". key_set, never the key: this JSON is served to
@@ -1211,6 +1234,49 @@ static esp_err_t post_ota_upload(httpd_req_t *req)
     return httpd_resp_send(req, "{\"ok\":true,\"installed\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
+/* {"proto":n,"address":n,"baud":n} -- which protocol is on the trunk, and
+ * the two settings a site actually changes.
+ *
+ * Nothing is started or stopped here. An output holding a UART cannot be
+ * swapped under a live trunk safely, and a BMS watching a device disappear
+ * mid-poll logs a fault; the page asks for a restart instead, which is one
+ * clean transition rather than two messy ones. */
+static esp_err_t post_bus(httpd_req_t *req)
+{
+    if (!may_write(req)) return ESP_OK;
+    char body[160];
+    int got = read_body(req, body, sizeof(body));
+    if (got < 0) return ESP_FAIL;
+    cJSON *root = cJSON_Parse(body);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "not JSON"); return ESP_FAIL; }
+
+    const cJSON *jp = cJSON_GetObjectItemCaseSensitive(root, "proto");
+    const cJSON *ja = cJSON_GetObjectItemCaseSensitive(root, "address");
+    const cJSON *jb = cJSON_GetObjectItemCaseSensitive(root, "baud");
+    esp_err_t e = ESP_OK;
+    const char *why = NULL;
+
+    if (cJSON_IsNumber(ja) && (e = out_common_set_address(ja->valueint)) != ESP_OK) {
+        why = "address must be 1-127 (valid for both Modbus and MS/TP)";
+    } else if (cJSON_IsNumber(jb) && (e = out_common_set_baud(jb->valueint)) != ESP_OK) {
+        why = "baud must be 0 (auto), 9600, 19200, 38400, 57600, 76800 or 115200";
+    } else if (cJSON_IsNumber(jp)) {
+        int p = jp->valueint;
+        if ((p == OUT_PROTO_MODBUS_RTU || p == OUT_PROTO_BACNET_MSTP) && !BOARD_HAS_RS485) {
+            why = "this board has no RS485 transceiver";
+        } else if ((p == OUT_PROTO_MODBUS_TCP || p == OUT_PROTO_BACNET_IP) &&
+                   netmgr_state() != NETMGR_STA_CONNECTED) {
+            why = "the IP protocols need the board to have joined a network";
+        } else if ((e = out_common_set_proto((out_proto_t)p)) != ESP_OK) {
+            why = "not a protocol this firmware knows";
+        }
+    }
+    cJSON_Delete(root);
+    if (why) return send_err(req, why);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true,\"restart\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
 /* Turns the periodic CHECK on or off. There is deliberately no equivalent for
  * installing: that always needs a person, so there is nothing to configure. */
 /* {"enabled":bool,"stats":bool}: the owner's fleet reporting choices. */
@@ -1823,9 +1889,9 @@ static esp_err_t route(httpd_req_t *req)
 #else
 #define ROUTES_TLS 0
 #endif
-/* 31, not 30: /api/ota/upload is ours (local firmware upload for a board with
+/* 32, not 30: /api/ota/upload and /api/bus are ours (local firmware upload for a board with
  * no route to GitHub). The static assert below is what caught the omission. */
-#define ROUTE_COUNT (31 + ROUTES_TAILSCALE + ROUTES_OUTAGELOG + ROUTES_HISTORY + ROUTES_TLS)
+#define ROUTE_COUNT (32 + ROUTES_TAILSCALE + ROUTES_OUTAGELOG + ROUTES_HISTORY + ROUTES_TLS)
 
 /* Order matters: the server tries these in turn and the wildcard route
  * matches everything, so it has to be last or it swallows the API. */
@@ -1843,6 +1909,7 @@ static const struct { const char *uri; httpd_method_t method; handler_fn fn; } R
     { "/api/ota/check",        HTTP_POST, post_ota_check },
     { "/api/ota/install",      HTTP_POST, post_ota_install },
     { "/api/ota/upload",       HTTP_POST, post_ota_upload },
+    { "/api/bus",              HTTP_POST, post_bus },
     { "/api/ota/auto",         HTTP_POST, post_ota_auto },
     { "/api/fleet",            HTTP_POST, post_fleet },
     { "/api/fleet/descriptor", HTTP_POST, post_fleet_descriptor },

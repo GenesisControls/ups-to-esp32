@@ -19,6 +19,8 @@
 #include "netmgr.h"
 #include "ups_hid.h"
 #include "nut_server.h"
+#include "out_common.h"
+#include "out_modbus.h"
 #include "snmp.h"
 #include "auth.h"
 #include "webui.h"
@@ -299,7 +301,22 @@ void app_main(void)
      * no UPS reading still leaves the page and updates, and no NUT server
      * still leaves the page. ota_start() most of all, as the way out. */
     if ((err = ups_hid_start()) != ESP_OK) start_failed("USB host", err);
+    /* After ups_hid, which it reads, and before any output that renders it:
+     * one point set, so Modbus and BACnet cannot answer differently in the
+     * same second. Not start_failed()'s business on its own -- a board
+     * without it still serves the page and NUT. */
+    if ((err = out_common_init()) != ESP_OK) {
+        ESP_LOGE(TAG, "point set did not start: %s", esp_err_to_name(err));
+    }
     if ((err = nut_server_start(NUT_DEFAULT_PORT)) != ESP_OK) start_failed("NUT server", err);
+    /* The BMS outputs. Each asks out_common_proto() and creates nothing
+     * unless it is the one selected, so the unused protocol costs a board
+     * nothing -- the pattern snmp_start() already uses below. Never
+     * start_failed()'s business: a board whose trunk will not come up must
+     * still serve its page so somebody can see why. */
+    if ((err = out_modbus_start()) != ESP_OK) {
+        ESP_LOGE(TAG, "Modbus did not start: %s", esp_err_to_name(err));
+    }
     /* An extra, like the fleet heartbeat: never start_failed()'s business. */
     if ((err = snmp_start()) != ESP_OK) ESP_LOGE(TAG, "SNMP did not start: %s", esp_err_to_name(err));
     ota_set_quiet_hook(ups_hid_quiet);   /* no UPS USB traffic while an update writes */
