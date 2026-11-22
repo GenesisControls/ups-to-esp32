@@ -88,3 +88,23 @@ CONFIG_UPSA_DEFAULT_ADMIN_PASS="Admin1234"
 # Off, the page comes up normally on the board's own access point and Wi-Fi is
 # one ordinary card among the others, there for the units that want it.
 CONFIG_UPSA_SETUP_SCREEN=n
+
+# --- Setup AP closes after ten minutes ---------------------------------------
+#
+# Upstream leaves the setup access point up until the board joins a network,
+# which for most of these adapters is never. An open, unauthenticated AP
+# broadcasting for years in twenty customer buildings is a standing invitation,
+# and it is on by default.
+#
+# Ten minutes from power-up is enough to configure a board. The clock restarts
+# whenever a client is associated, so it cannot close under a technician
+# mid-configuration, and it restarts on every BOOT press.
+#
+# The way back is deliberately physical, because it has to work when the
+# network is off: press BOOT, or power-cycle the board. A power cycle always
+# gives a fresh ten minutes, so there is no state in which a board is
+# unreachable to someone standing next to it.
+#
+# A board that HAS joined a network is never touched by this -- its radio is
+# carrying Modbus TCP or BACnet/IP.
+CONFIG_UPSA_AP_WINDOW_S=600

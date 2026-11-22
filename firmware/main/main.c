@@ -128,6 +128,13 @@ static void factory_gesture_poll(factory_gesture_t *g)
     g->stable = raw;
     if (!g->stable) return;                           /* presses, not releases */
 
+    /* ANY press reopens the setup AP if its window turned the radio off, and
+     * buys another full window if it is still up. Counted separately from the
+     * five-press factory reset below, so one press is a way back onto a board
+     * whose radio has closed and five still wipe it. With the radio off this
+     * button is the only way in that does not need a cable. */
+    netmgr_ap_reopen();
+
     TickType_t now = xTaskGetTickCount();
     if (g->count == 0 || now - g->first > pdMS_TO_TICKS(FACTORY_WINDOW_MS)) {
         g->count = 0;
