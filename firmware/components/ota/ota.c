@@ -28,7 +28,12 @@ static const char *TAG = "ota";
 
 /* The releases endpoint, not a branch: see the note in ota.h. /latest skips
  * prereleases; the list, newest first, includes them -- one item is enough. */
-#define GH_REPO   "https://api.github.com/repos/aronreid/ups-to-esp32/releases"
+/* Which repository's releases this board follows. A fork ships its own
+ * boards and must point at its own assets; see components/ota/Kconfig.projbuild. */
+#ifndef CONFIG_UPSA_OTA_REPO
+#define CONFIG_UPSA_OTA_REPO "aronreid/ups-to-esp32"
+#endif
+#define GH_REPO   "https://api.github.com/repos/" CONFIG_UPSA_OTA_REPO "/releases"
 #define GH_API    GH_REPO "/latest"
 /* The ten most recent releases. NOT per_page=1: GitHub does not list them
  * newest first -- v0.09 came back ahead of v0.10-rc1, published half an hour
@@ -935,7 +940,13 @@ esp_err_t ota_start(void)
     /* Default ON for CHECKING only, and the page says what that means. A
      * device that never looks can never tell its owner an update exists, and
      * the owner still has to press install. */
+#ifdef CONFIG_UPSA_OTA_NO_AUTO_CHECK
+    /* Boards installed on other people's networks: no outbound connection on
+     * a timer until the owner asks for one. The page can still turn it on. */
+    s_st.auto_check = false;
+#else
     s_st.auto_check = true;
+#endif
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
         uint8_t v;

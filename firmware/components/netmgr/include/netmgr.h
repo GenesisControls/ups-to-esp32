@@ -145,6 +145,17 @@ int netmgr_scan(netmgr_ap_t *out, int max);
 void netmgr_ap_reopen(void);
 int  netmgr_ap_window_left_s(void);
 
+/* Override the window and leave the radio up for good. Persisted.
+ *
+ * For a bench, and for the rare site that wants the page always reachable.
+ * It is a real decision, not a convenience: an open, unauthenticated access
+ * point broadcasting permanently in a customer's building is the thing the
+ * window exists to avoid, so the page says so plainly rather than offering
+ * this as a neutral checkbox. No effect on a board that has joined a network
+ * -- its radio is carrying data and was never going to be switched off. */
+bool      netmgr_ap_always_on(void);
+esp_err_t netmgr_set_ap_always_on(bool on);
+
 esp_err_t netmgr_factory_reset(void);
 
 /* Dotted-quad of the current address, or "0.0.0.0". For the status page. */

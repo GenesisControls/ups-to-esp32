@@ -578,6 +578,7 @@ static esp_netif_t *create_sta(bool lan)
 static esp_timer_handle_t s_ap_timer;
 static int64_t            s_ap_deadline_us;
 static bool               s_ap_closed;
+static bool               s_ap_always;    /* window overridden: stay up */
 
 static int64_t ap_window_us(void)
 {
@@ -589,7 +590,7 @@ static void ap_window_cb(void *arg)
     (void)arg;
     /* A board that joined a network is carrying data on its radio. The window
      * is only ever about the setup AP of a board that has not. */
-    if (s_state != NETMGR_AP_PROVISIONING || s_ap_closed) return;
+    if (s_state != NETMGR_AP_PROVISIONING || s_ap_closed || s_ap_always) return;
 
     wifi_sta_list_t sl;
     if (esp_wifi_ap_get_sta_list(&sl) == ESP_OK && sl.num > 0) {
@@ -623,9 +624,35 @@ void netmgr_ap_reopen(void)
              CONFIG_UPSA_AP_WINDOW_S, esp_err_to_name(e));
 }
 
+bool netmgr_ap_always_on(void) { return s_ap_always; }
+
+esp_err_t netmgr_set_ap_always_on(bool on)
+{
+    nvs_handle_t h;
+    esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (e != ESP_OK) return e;
+    nvs_set_u8(h, "ap_always", on ? 1 : 0);
+    e = nvs_commit(h);
+    nvs_close(h);
+    if (e != ESP_OK) return e;
+    s_ap_always = on;
+    if (on) {
+        /* Takes effect at once, in both directions: switching it on brings a
+         * closed radio straight back rather than making someone power-cycle
+         * to use the switch they just set. */
+        netmgr_ap_reopen();
+        ESP_LOGW(TAG, "setup AP will stay up indefinitely (window overridden)");
+    } else {
+        s_ap_deadline_us = esp_timer_get_time() + ap_window_us();
+        ESP_LOGI(TAG, "setup AP window back on: %ds", CONFIG_UPSA_AP_WINDOW_S);
+    }
+    return ESP_OK;
+}
+
 int netmgr_ap_window_left_s(void)
 {
-    if (ap_window_us() <= 0 || s_state != NETMGR_AP_PROVISIONING) return -1;
+    if (ap_window_us() <= 0 || s_ap_always) return -1;
+    if (s_state != NETMGR_AP_PROVISIONING) return -1;
     if (s_ap_closed) return 0;
     int64_t left = (s_ap_deadline_us - esp_timer_get_time()) / 1000000;
     return left < 0 ? 0 : (int)left;
@@ -688,6 +715,15 @@ static void start_softap(void)
 
 esp_err_t netmgr_start(void)
 {
+    {   /* Read before the AP comes up, so its window is armed correctly the
+         * first time rather than closing once and then being overridden. */
+        nvs_handle_t nh;
+        if (nvs_open(NVS_NS, NVS_READONLY, &nh) == ESP_OK) {
+            uint8_t v = 0;
+            if (nvs_get_u8(nh, "ap_always", &v) == ESP_OK) s_ap_always = v != 0;
+            nvs_close(nh);
+        }
+    }
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     netmgr_ip6_init();

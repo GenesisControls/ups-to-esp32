@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+menu "My UPS Pal updates"
+
+config UPSA_OTA_REPO
+    string "GitHub repository to check for releases (owner/name)"
+    default "aronreid/ups-to-esp32"
+    help
+        Where the board looks for firmware. The default is upstream's own
+        repository, which is right for upstream's boards and wrong for a
+        fork: assets are named ups-adaptor-<BOARD_OTA_TARGET>.bin, so a board
+        with its own target finds nothing there and checks for ever in vain.
+
+        A fork shipping its own boards points this at its own repository and
+        publishes assets for its own target.
+
+config UPSA_OTA_NO_AUTO_CHECK
+    bool "Never check for updates unless the owner turns it on"
+    default n
+    help
+        Upstream defaults the periodic CHECK to ON (ota.c), on the reasoning
+        that a device which never looks can never tell its owner an update
+        exists. Note that ota.h's comment says the opposite; the code is what
+        runs.
+
+        Turn this on for boards installed on other people's networks. A
+        device reaching the internet on a timer from inside a customer's
+        building is their decision, and the honest default for gear we
+        install there is not to, until someone asks for it. The owner can
+        still enable checking on the page, and installing always needs a
+        person either way.
+
+endmenu

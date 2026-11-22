@@ -27,6 +27,8 @@ static const char *TAG = "outcom";
 #define KEY_PROTO       "oc_proto"
 #define KEY_ADDR        "oc_addr"
 #define KEY_BAUD        "oc_baud"
+#define KEY_FMT         "oc_fmt"
+#define KEY_CMD         "oc_cmd"
 
 /* Comm-OK's threshold. The other track's README specifies 10 s, and upstream
  * independently arrives at the same number: FAILURES_BEFORE_RESET (5) polls
@@ -51,6 +53,8 @@ static out_hb_policy_t   s_hb = OUT_HB_INVALID;
 static out_proto_t       s_proto = OUT_PROTO_NONE;
 static int               s_addr = OUT_ADDR_DEFAULT;
 static int               s_baud = OUT_BAUD_AUTO;
+static out_fmt_t         s_fmt = OUT_FMT_8N1;
+static bool              s_cmd_enabled;   /* bus commands: off unless asked */
 
 /* ---- helpers ---------------------------------------------------------- */
 
@@ -263,13 +267,19 @@ static void load_settings(void)
     uint8_t hb = 0;
     if (nvs_get_u8(h, KEY_HB, &hb) == ESP_OK) s_hb = hb ? OUT_HB_RUN : OUT_HB_INVALID;
     uint8_t pr = 0;
-    if (nvs_get_u8(h, KEY_PROTO, &pr) == ESP_OK && pr <= OUT_PROTO_BACNET_IP) {
+    if (nvs_get_u8(h, KEY_PROTO, &pr) == ESP_OK &&
+        pr >= OUT_PROTO_NONE && pr <= OUT_PROTO_BACNET_IP) {
         s_proto = (out_proto_t)pr;
     }
     uint8_t ad = 0;
     if (nvs_get_u8(h, KEY_ADDR, &ad) == ESP_OK && ad >= 1 && ad <= 127) s_addr = ad;
     int32_t bd = 0;
     if (nvs_get_i32(h, KEY_BAUD, &bd) == ESP_OK && bd >= 0) s_baud = bd;
+    uint8_t cm = 0;
+    if (nvs_get_u8(h, KEY_CMD, &cm) == ESP_OK) s_cmd_enabled = cm != 0;
+    uint8_t fm = 0;
+    if (nvs_get_u8(h, KEY_FMT, &fm) == ESP_OK &&
+        fm >= OUT_FMT_8N1 && fm <= OUT_FMT_8N2) s_fmt = (out_fmt_t)fm;
     nvs_close(h);
 }
 
@@ -288,7 +298,7 @@ out_proto_t out_common_proto(void) { return s_proto; }
 
 esp_err_t out_common_set_proto(out_proto_t p)
 {
-    if (p > OUT_PROTO_BACNET_IP) return ESP_ERR_INVALID_ARG;
+    if (p < OUT_PROTO_NONE || p > OUT_PROTO_BACNET_IP) return ESP_ERR_INVALID_ARG;
     esp_err_t e = put_u8(KEY_PROTO, (uint8_t)p);
     if (e == ESP_OK) {
         s_proto = p;
@@ -375,9 +385,10 @@ esp_err_t out_common_init(void)
     ESP_LOGI(TAG, "point set up: boot %u, battery life %d years, heartbeat %s on comm loss",
              (unsigned)s_boots, s_bat_life_years,
              s_hb == OUT_HB_RUN ? "keeps counting" : "reads 65535");
-    ESP_LOGI(TAG, "bus: %s, address %d, baud %s",
+    ESP_LOGI(TAG, "bus: %s, address %d, baud %s, %s",
              out_common_proto_name(s_proto), s_addr,
-             s_baud == OUT_BAUD_AUTO ? "auto" : "fixed");
+             s_baud == OUT_BAUD_AUTO ? "auto" : "fixed",
+             out_common_format_name(s_fmt));
     return ESP_OK;
 }
 
@@ -438,3 +449,83 @@ esp_err_t out_common_set_hb_policy(out_hb_policy_t p)
 }
 
 out_hb_policy_t out_common_hb_policy(void) { return s_hb; }
+
+bool out_common_cmd_enabled(void) { return s_cmd_enabled; }
+
+esp_err_t out_common_set_cmd_enabled(bool on)
+{
+    esp_err_t e = put_u8(KEY_CMD, on ? 1 : 0);
+    if (e == ESP_OK) {
+        s_cmd_enabled = on;
+        ESP_LOGW(TAG, "commands from the bus are now %s", on ? "ENABLED" : "off");
+    }
+    return e;
+}
+
+out_fmt_t out_common_format(void) { return s_fmt; }
+
+esp_err_t out_common_set_format(out_fmt_t f)
+{
+    if (f < OUT_FMT_8N1 || f > OUT_FMT_8N2) return ESP_ERR_INVALID_ARG;
+    esp_err_t e = put_u8(KEY_FMT, (uint8_t)f);
+    if (e == ESP_OK) s_fmt = f;
+    return e;
+}
+
+const char *out_common_format_name(out_fmt_t f)
+{
+    switch (f) {
+    case OUT_FMT_8E1: return "8E1";
+    case OUT_FMT_8O1: return "8O1";
+    case OUT_FMT_8N2: return "8N2";
+    default:          return "8N1";
+    }
+}
+
+const char *out_common_discrete_name(int i)
+{
+    static const char *const N[OUT_DISCRETE_N] = {
+        "Online", "On battery", "Low battery", "Replace battery", "Overload",
+        "UPS comm OK", "AVR boost", "AVR trim", "Charging",
+        "Battery age alarm", "Output not protecting",
+    };
+    return (i >= 0 && i < OUT_DISCRETE_N) ? N[i] : "";
+}
+
+const char *out_common_reg_name(int i)
+{
+    switch (i) {
+    case OUT_R_CHARGE_PCT:       return "Battery charge";
+    case OUT_R_RUNTIME_S:        return "Runtime remaining";
+    case OUT_R_LOAD_PCT:         return "Load";
+    case OUT_R_INPUT_V10:        return "Input voltage";
+    case OUT_R_OUTPUT_V10:       return "Output voltage";
+    case OUT_R_BATTERY_V10:      return "Battery voltage";
+    case OUT_R_HEARTBEAT:        return "Heartbeat";
+    case OUT_R_STATUS_BITS:      return "Status bitfield (bits 0-5)";
+    case OUT_R_BATTERY_AGE_D:    return "Days since battery change";
+    case OUT_R_TEST_RESULT:      return "Self-test result";
+    case OUT_R_TRANSFER_LOW_V10: return "Input transfer low";
+    case OUT_R_TRANSFER_HIGH_V10:return "Input transfer high";
+    case OUT_R_FW_VERSION:       return "Firmware version";
+    case OUT_R_RESET_COUNT:      return "Restart counter";
+    case OUT_R_RESET_REASON:     return "Last restart reason";
+    default:                     return "";     /* reserved: no such address */
+    }
+}
+
+const char *out_common_reg_unit(int i)
+{
+    switch (i) {
+    case OUT_R_CHARGE_PCT:
+    case OUT_R_LOAD_PCT:         return "%";
+    case OUT_R_RUNTIME_S:        return "s";
+    case OUT_R_INPUT_V10:
+    case OUT_R_OUTPUT_V10:
+    case OUT_R_BATTERY_V10:
+    case OUT_R_TRANSFER_LOW_V10:
+    case OUT_R_TRANSFER_HIGH_V10:return "V x10";
+    case OUT_R_BATTERY_AGE_D:    return "days";
+    default:                     return "";
+    }
+}

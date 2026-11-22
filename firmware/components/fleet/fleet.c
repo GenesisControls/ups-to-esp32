@@ -626,6 +626,18 @@ esp_err_t fleet_start(void)
         nvs_close(h);
     }
 
+#ifdef CONFIG_UPSA_FLEET_DISABLED
+    /* Not compiled out -- just never started. No task, no 6 KB stack, no
+     * timer, and nothing that can be switched on by accident later. fleet_get()
+     * still answers, so the page reports it as not configured rather than
+     * showing an empty card. */
+    s_st.configured = false;
+    s_st.enabled    = false;
+    s_st.stats      = false;
+    ESP_LOGI(TAG, "fleet check-in disabled in this build");
+    return ESP_OK;
+#endif
+
     /* Priority 1: below every task that does the board's job. */
     if (xTaskCreate(fleet_task, "fleet", 6144, NULL, 1, NULL) != pdPASS) return ESP_ERR_NO_MEM;
     ESP_LOGI(TAG, "%s; heartbeat %s, stats %s",

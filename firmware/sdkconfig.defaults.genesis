@@ -48,6 +48,10 @@
 # stale generated sdkconfig was reused.
 CONFIG_UPSA_FLEET_URL=""
 CONFIG_UPSA_FLEET_KEY=""
+# Decided 2026-11-22: Genesis does not use fleet reporting at all. Empty
+# strings alone would leave the task running and finding nothing to do, so
+# this stops it being created -- no 6 KB stack, nothing to enable by mistake.
+CONFIG_UPSA_FLEET_DISABLED=y
 
 # --- Default login -----------------------------------------------------------
 #
@@ -108,3 +112,22 @@ CONFIG_UPSA_SETUP_SCREEN=n
 # A board that HAS joined a network is never touched by this -- its radio is
 # carrying Modbus TCP or BACnet/IP.
 CONFIG_UPSA_AP_WINDOW_S=600
+
+# --- Updates: our releases, and no checking by default -----------------------
+#
+# ota.c hardcodes upstream's repository, and defaults the periodic check to ON
+# (ota.h's comment says otherwise; the code is what runs). Left alone, every
+# Genesis board would call api.github.com/repos/aronreid/... every twelve
+# hours from inside a customer's building, and find nothing: assets are named
+# ups-adaptor-<BOARD_OTA_TARGET>.bin and ours is genesis-rs485.
+#
+# So: our repository, and no automatic checking. A board that never joins a
+# network could not check anyway, and for the one that does, an outbound
+# connection on a timer from a customer's network is their call, not a
+# default. The owner can still enable it on the page, and installing has
+# always needed a person.
+#
+# Updating in practice is the local upload path (POST /api/ota/upload): a
+# laptop on the board's own access point, no internet involved.
+CONFIG_UPSA_OTA_REPO="GenesisControls/ups-to-esp32"
+CONFIG_UPSA_OTA_NO_AUTO_CHECK=y

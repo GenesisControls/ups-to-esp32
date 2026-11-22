@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "out_modbus.h"
 #include "out_common.h"
+#include "ups_hid.h"
 #include "board.h"
 #include "mbcontroller.h"
 #include "driver/uart.h"
@@ -18,6 +19,22 @@ static const char *TAG = "out_mb";
  * is the rate a BMS integrator reaches for first. Logged loudly, because a
  * silent wrong guess is worse than a noisy one. */
 #define BAUD_FALLBACK   9600
+
+/* THE ONE WRITABLE ADDRESS. Coil 100: start a quick battery self-test.
+ *
+ * Deliberately far from the mirrored discretes (0-10) so it can never be hit
+ * by a master sweeping the status block, and in a range the other track's map
+ * does not define. PROVISIONAL until they allocate it properly -- a command
+ * address belongs in the shared contract, not in whichever implementation
+ * wrote it first.
+ *
+ * Write 1 to start. It self-clears, so it is a trigger and not a state; a
+ * master that leaves it set does not re-fire. */
+#define CMD_COIL_ADDR   100
+/* A stuck or misconfigured master must not be able to cycle the battery. A
+ * quick test is seconds of load on battery; one every half hour is generous
+ * for any real use and useless as a way to flatten a pack. */
+#define CMD_MIN_GAP_US  (30LL * 60 * 1000000)
 #define REFRESH_MS      1000
 
 /* The register image the stack serves from. esp-modbus answers reads straight
@@ -29,6 +46,16 @@ static uint16_t s_hreg[OUT_REG_N];          /* the FC3 mirror of the same data *
 static uint8_t  s_disc[(OUT_DISCRETE_N + 7) / 8];
 static uint8_t  s_coil[(OUT_DISCRETE_N + 7) / 8];
 
+/* A one-minute sliding window, in six ten-second buckets: enough to show a
+ * rate without keeping timestamps for every frame. */
+#define RATE_BUCKETS    6
+#define RATE_BUCKET_US  (10LL * 1000000)
+static uint32_t s_bucket[RATE_BUCKETS];
+static int64_t  s_bucket_at_us;
+static int      s_bucket_i;
+
+static uint8_t  s_cmd;          /* the command coil's one byte */
+static int64_t  s_cmd_last_us;
 static out_modbus_stat_t s_stat;
 static SemaphoreHandle_t s_stat_lock;
 static void *s_handler;
@@ -86,6 +113,49 @@ static void refresh(void)
  * shows it on the status page. It does NOT produce exception 02. That is a
  * genuine deviation from the contract and belongs on the other track's desk,
  * not buried here. */
+/* Coil 100 went high. Everything that can refuse this, refuses it here.
+ *
+ * Reversing "read-only on the bus" was Tobias's call on 2026-11-22; the
+ * reasons it was the rule are unchanged, so the guards are the compensation:
+ * the board owner opts in, the UPS must say it can self-test, and the rate
+ * limit means the worst a hostile or broken master achieves is one quick
+ * test every half hour. */
+static void cmd_check(void)
+{
+    if (!(s_cmd & 1u)) return;
+    s_cmd = 0;                                  /* a trigger, not a state */
+
+    if (!out_common_cmd_enabled()) {
+        ESP_LOGW(TAG, "self-test requested from the bus, but commands are off on this board");
+        return;
+    }
+    ups_data_t d;
+    ups_hid_get(&d);
+    if (!d.attached) {
+        ESP_LOGW(TAG, "self-test requested, but no UPS is attached");
+        return;
+    }
+    if (!(d.caps & UPS_CAP_TEST)) {
+        /* From the UPS's own report descriptor, never from its model name. */
+        ESP_LOGW(TAG, "self-test requested, but this UPS does not report that it can");
+        return;
+    }
+    int64_t now = esp_timer_get_time();
+    if (s_cmd_last_us && (now - s_cmd_last_us) < CMD_MIN_GAP_US) {
+        ESP_LOGW(TAG, "self-test requested %llds after the last one; ignored (minimum %lld min)",
+                 (long long)((now - s_cmd_last_us) / 1000000),
+                 (long long)(CMD_MIN_GAP_US / 60000000));
+        return;
+    }
+    s_cmd_last_us = now;
+    esp_err_t e = ups_hid_command(UPS_CMD_TEST_QUICK, 0);
+    ESP_LOGW(TAG, "QUICK BATTERY SELF-TEST started from the bus: %s. "
+                  "The load is on battery while it runs.", esp_err_to_name(e));
+    xSemaphoreTake(s_stat_lock, portMAX_DELAY);
+    s_stat.tests_started++;
+    xSemaphoreGive(s_stat_lock);
+}
+
 static void mb_task(void *arg)
 {
     (void)arg;
@@ -101,15 +171,45 @@ static void mb_task(void *arg)
         if (ev) {
             xSemaphoreTake(s_stat_lock, portMAX_DELAY);
             s_stat.requests++;
+            s_bucket[s_bucket_i]++;
             s_stat.last_request_us = esp_timer_get_time();
+            if (ev & MB_EVENT_INPUT_REG_RD)   s_stat.rd_input++;
+            if (ev & MB_EVENT_HOLDING_REG_RD) s_stat.rd_holding++;
+            if (ev & MB_EVENT_DISCRETE_RD)    s_stat.rd_discrete++;
+            if (ev & MB_EVENT_COILS_RD)       s_stat.rd_coil++;
             if (ev & (MB_EVENT_HOLDING_REG_WR | MB_EVENT_COILS_WR)) {
                 s_stat.writes_refused++;
             }
             xSemaphoreGive(s_stat_lock);
+            if (ev & MB_EVENT_COILS_WR) cmd_check();
             if (ev & (MB_EVENT_HOLDING_REG_WR | MB_EVENT_COILS_WR)) {
-                ESP_LOGW(TAG, "a write arrived on a read-only device; undoing it");
-                refresh();                  /* put the value straight back */
+                /* The status coils and every register are read-only; only the
+                 * command coil above means anything, and cmd_check() has
+                 * already consumed it. */
+                refresh();                  /* put the status values back */
             }
+        }
+
+        /* Roll the rate window, and sample the collision flag. The flag is
+         * sticky until read, so reading it here both counts and clears it. */
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - s_bucket_at_us >= RATE_BUCKET_US) {
+            s_bucket_at_us = now_us;
+            s_bucket_i = (s_bucket_i + 1) % RATE_BUCKETS;
+            uint32_t sum = 0;
+            xSemaphoreTake(s_stat_lock, portMAX_DELAY);
+            s_bucket[s_bucket_i] = 0;               /* reuse the oldest */
+            for (int i = 0; i < RATE_BUCKETS; i++) sum += s_bucket[i];
+            s_stat.per_min = sum;
+            xSemaphoreGive(s_stat_lock);
+        }
+        bool collided = false;
+        if (uart_get_collision_flag(BOARD_RS485_UART, &collided) == ESP_OK && collided) {
+            xSemaphoreTake(s_stat_lock, portMAX_DELAY);
+            s_stat.collisions++;
+            xSemaphoreGive(s_stat_lock);
+            ESP_LOGW(TAG, "RS485 collision: another device keyed the line while we "
+                          "were transmitting -- check for a duplicate address");
         }
 
         if (xTaskGetTickCount() - next >= period) {
@@ -145,6 +245,10 @@ esp_err_t out_modbus_start(void)
         ESP_LOGW(TAG, "baud is set to auto but autobaud is not built yet: using %d", baud);
     }
     const int addr = out_common_address();
+    const out_fmt_t fmt = out_common_format();
+    const uart_parity_t par = (fmt == OUT_FMT_8E1) ? UART_PARITY_EVEN
+                            : (fmt == OUT_FMT_8O1) ? UART_PARITY_ODD
+                                                   : UART_PARITY_DISABLE;
 
     esp_err_t err = mbc_slave_init(MB_PORT_SERIAL_SLAVE, &s_handler);
     if (err != ESP_OK) { ESP_LOGE(TAG, "slave init: %s", esp_err_to_name(err)); return err; }
@@ -154,7 +258,7 @@ esp_err_t out_modbus_start(void)
         .slave_addr = (uint8_t)addr,
         .port       = BOARD_RS485_UART,
         .baudrate   = (uint32_t)baud,
-        .parity     = UART_PARITY_DISABLE,
+        .parity     = par,
     };
     if ((err = mbc_slave_setup(&comm)) != ESP_OK) {
         ESP_LOGE(TAG, "slave setup: %s", esp_err_to_name(err));
@@ -189,6 +293,18 @@ esp_err_t out_modbus_start(void)
         d.type    = MB_PARAM_COIL;
         d.address = s_coil;
         if ((err = mbc_slave_set_descriptor(d)) != ESP_OK) goto fail;
+
+        /* The command coil, in its own area well away from the status block.
+         * Registered whether or not commands are enabled, so a master gets a
+         * clean "0" rather than an exception from a board that merely has the
+         * feature switched off -- cmd_check() is what refuses the action. */
+        mb_register_area_descriptor_t cm = {
+            .start_offset = CMD_COIL_ADDR,
+            .type         = MB_PARAM_COIL,
+            .address      = &s_cmd,
+            .size         = sizeof(s_cmd),
+        };
+        if ((err = mbc_slave_set_descriptor(cm)) != ESP_OK) goto fail;
     }
 
     if ((err = mbc_slave_start()) != ESP_OK) {
@@ -208,19 +324,33 @@ esp_err_t out_modbus_start(void)
         ESP_LOGE(TAG, "uart_set_mode RS485: %s", esp_err_to_name(err));
         return err;
     }
+    /* Stop bits are not in mb_communication_info_t, so esp-modbus leaves
+     * whatever the UART defaults to. Set them explicitly after the stack has
+     * the port, or an 8N2 master sees frame errors that look exactly like a
+     * wrong baud rate. */
+    if ((err = uart_set_stop_bits(BOARD_RS485_UART,
+                                  fmt == OUT_FMT_8N2 ? UART_STOP_BITS_2
+                                                     : UART_STOP_BITS_1)) != ESP_OK) {
+        ESP_LOGE(TAG, "uart_set_stop_bits: %s", esp_err_to_name(err));
+        return err;
+    }
 
     xSemaphoreTake(s_stat_lock, portMAX_DELAY);
     s_stat.running = true;
     s_stat.address = addr;
     s_stat.baud    = baud;
+    s_stat.format  = out_common_format_name(fmt);
     xSemaphoreGive(s_stat_lock);
 
     if (xTaskCreate(mb_task, "out_mb", 3072, NULL, 4, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "Modbus RTU slave up: address %d, %d baud 8N1, "
+    ESP_LOGI(TAG, "Modbus RTU slave up: address %d, %d baud %s, "
                   "TX %d RX %d DE %d (hardware RTS)",
-             addr, baud, BOARD_PIN_RS485_TX, BOARD_PIN_RS485_RX, BOARD_PIN_RS485_DE);
+             addr, baud, out_common_format_name(fmt),
+             BOARD_PIN_RS485_TX, BOARD_PIN_RS485_RX, BOARD_PIN_RS485_DE);
+    ESP_LOGI(TAG, "bus commands %s (coil %d starts a quick self-test)",
+             out_common_cmd_enabled() ? "ENABLED" : "off", CMD_COIL_ADDR);
     return ESP_OK;
 
 fail:

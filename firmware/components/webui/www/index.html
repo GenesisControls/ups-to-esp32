@@ -574,28 +574,6 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
     <div id="fleet"></div>
 
     <div class="gh"><span class="k">Settings</span><i></i></div>
-    <details class="card" id="bus-card">
-      <summary><span class="k">BMS bus</span><span id="bus-sum"> </span></summary>
-      <p class="note">What this adapter puts the UPS on, for a building management system.
-        One protocol at a time &mdash; the trunk cannot carry two. The UPS data is read-only on
-        the bus: this device never accepts commands from it. Changes need a restart.</p>
-      <label for="bus-proto">Protocol</label>
-      <select id="bus-proto"></select>
-      <label for="bus-addr">Address <span class="note">(Modbus unit ID, or BACnet MS/TP MAC &mdash; 1 to 127)</span></label>
-      <input id="bus-addr" inputmode="numeric" autocomplete="off">
-      <label for="bus-baud">Baud</label>
-      <select id="bus-baud">
-        <option value="0">auto</option>
-        <option value="9600">9600</option>
-        <option value="19200">19200</option>
-        <option value="38400">38400</option>
-        <option value="57600">57600</option>
-        <option value="76800">76800</option>
-        <option value="115200">115200</option>
-      </select>
-      <button class="btn" id="bus-save">Save</button>
-      <p class="note" id="bus-stat"></p>
-    </details>
     <details class="card" id="auth-card">
       <summary><span class="k">Login</span><span id="auth-sum"> </span></summary>
       <p class="note" id="pw-default" hidden><b>This board still has its built-in default
@@ -626,6 +604,60 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
       <pre id="dbg-json" class="note" style="white-space:pre-wrap;word-break:break-all;user-select:all;-webkit-user-select:all" hidden></pre>
     </details>
   </section>
+
+  <!-- The BMS bus gets its own section: it is what this adapter is FOR,
+       and a commissioning engineer should not have to go hunting for it
+       under the board's own settings. -->
+  <section class="sec" id="s-bms" hidden>
+    <div class="gh"><span class="k">RS485 / BMS</span><i></i></div>
+    <details class="card" id="pts-card">
+      <summary><span class="k">Register overview</span><span id="pts-sum"> </span></summary>
+      <p class="note">Every address this device serves and what it reads right now, for ticking
+        against a Niagara point sheet. Values are <b>raw</b>, because raw is what a BMS reads:
+        register 3 showing 2401 is how you confirm Niagara renders 240.1&nbsp;V.
+        <b>65535</b> means this UPS does not report it, or the UPS link is down.
+        <b>absent</b> means the address does not exist on this device and answers Modbus
+        exception 02 &mdash; a different answer, and one a master can tell apart.</p>
+      <div id="pts-body"><p class="note">Open this card to read the points.</p></div>
+    </details>
+    <details class="card" id="bus-card">
+      <summary><span class="k">BMS bus</span><span id="bus-sum"> </span></summary>
+      <p class="note">What this adapter puts the UPS on, for a building management system.
+        One protocol at a time &mdash; the trunk cannot carry two. The UPS data is read-only on
+        the bus: this device never accepts commands from it. Changes need a restart.</p>
+      <label for="bus-proto">Protocol</label>
+      <select id="bus-proto"></select>
+      <label for="bus-addr">Address <span class="note">(Modbus unit ID, or BACnet MS/TP MAC &mdash; 1 to 127)</span></label>
+      <input id="bus-addr" inputmode="numeric" autocomplete="off">
+      <label for="bus-fmt">Data format</label>
+      <select id="bus-fmt">
+        <option value="1">8N1 &mdash; no parity, 1 stop bit</option>
+        <option value="2">8E1 &mdash; even parity</option>
+        <option value="3">8O1 &mdash; odd parity</option>
+        <option value="4">8N2 &mdash; no parity, 2 stop bits</option>
+      </select>
+      <label for="bus-baud">Baud</label>
+      <select id="bus-baud">
+        <option value="0">auto</option>
+        <option value="9600">9600</option>
+        <option value="19200">19200</option>
+        <option value="38400">38400</option>
+        <option value="57600">57600</option>
+        <option value="76800">76800</option>
+        <option value="115200">115200</option>
+      </select>
+      <label class="chk"><input type="checkbox" id="bus-cmd"> allow a battery self-test to be started from the bus</label>
+      <p class="note">Off by default, and worth leaving off unless you need it. An RS485 trunk is
+        unauthenticated, and a self-test puts this site&rsquo;s load on battery while it runs.
+        With it on, writing <b>coil 100</b> starts one quick test &mdash; refused unless the UPS
+        reports it can self-test, and at most one every 30 minutes. Everything else on the bus
+        stays read-only.</p>
+      <button class="btn" id="bus-save">Save</button>
+      <button class="btn" id="bus-reboot">Restart board</button>
+      <p class="note" id="bus-stat"></p>
+      <div id="bus-comms"></div>
+    </details>
+  </section>
 </div>
 
 <div id="scrim" hidden></div>
@@ -642,6 +674,7 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
   <div class="k" id="m-board" hidden>This board</div>
   <div class="mg">
     <button type="button" data-s="board" style="grid-column:1/-1">Board<i class="dot" id="fw-dot2" hidden></i></button>
+    <button type="button" data-s="bms" style="grid-column:1/-1">RS485 / BMS</button>
   </div>
 </div>
 
@@ -1188,7 +1221,7 @@ $('lg-cancel').onclick=()=>loginDone(false);
 /* ---- sections and the menu ----
  * The address keeps the place: #power, or #ups=2/power on a hub build, so a
  * bookmark or a reload comes back to the same pal and section. */
-const SECS={overview:'Overview',power:'Power',history:'History',controls:'Controls',board:'Board'};
+const SECS={overview:'Overview',power:'Power',history:'History',controls:'Controls',board:'Board',bms:'RS485 / BMS'};
 /* The four board sections became one: an old bookmark still lands there. */
 const OLD_SECS={connect:'board',network:'board',firmware:'board',settings:'board'};
 let sec=(location.hash.match(/([a-z]+)$/)||[])[1];
@@ -2127,35 +2160,114 @@ if($('fwup-go')) $('fwup-go').onclick=async()=>{
 // wants it.
 let busBuilt=null;
 function busUI(b){
-  const key=JSON.stringify([b.rs485,b.ip,b.proto,b.address,b.baud]);
+  const key=JSON.stringify([b.rs485,b.ip,b.proto,b.address,b.baud,b.format,b.cmd]);
   if(busBuilt!==key){
     busBuilt=key;
-    const opts=[[0,'none (nothing on the bus)']];
-    if(b.rs485){ opts.push([1,'Modbus RTU (RS485)']); opts.push([2,'BACnet MS/TP (RS485)']); }
-    if(b.ip){ opts.push([3,'Modbus TCP']); opts.push([4,'BACnet/IP']); }
+    const opts=[[1,'none (nothing on the bus)']];
+    if(b.rs485){ opts.push([2,'Modbus RTU (RS485)']); opts.push([3,'BACnet MS/TP (RS485)']); }
+    if(b.ip){ opts.push([4,'Modbus TCP']); opts.push([5,'BACnet/IP']); }
     $('bus-proto').innerHTML=opts.map(o=>`<option value="${o[0]}">${esc(o[1])}</option>`).join('');
-    $('bus-proto').value=String(b.proto||0);
+    $('bus-proto').value=String(b.proto||1);
     $('bus-addr').value=b.address||4;
     $('bus-baud').value=String(b.baud===undefined?0:b.baud);
+    $('bus-fmt').value=String(b.format||1);
+    $('bus-cmd').checked=!!b.cmd;
   }
-  const names=['none','Modbus RTU','BACnet MS/TP','Modbus TCP','BACnet/IP'];
-  $('bus-sum').textContent = b.proto ? `${names[b.proto]} · address ${b.address}` : 'nothing selected';
+  // Index 0 is unused: the C enums start at 1 so a zero can never be
+  // mistaken for a real choice that simply was not sent.
+  const names=['','none','Modbus RTU','BACnet MS/TP','Modbus TCP','BACnet/IP'];
+  const fmts=['','8N1','8E1','8O1','8N2'];
+
+  $('bus-sum').textContent = (b.proto>1) ? `${names[b.proto]} · address ${b.address}` : 'nothing selected';
   let st;
-  if(!b.proto) st='Nothing is being served. Pick a protocol and restart.';
+  if(!b.proto||b.proto===1) st='Nothing is being served. Pick a protocol and restart.';
   else if(!b.running) st=`${names[b.proto]} is selected but not running — restart to apply.`;
   else if(b.quiet_s<0) st=`Running at ${b.baud||'auto'} baud. Nothing has polled this device yet.`;
-  else st=`Running at ${b.baud} baud · ${b.requests} request${b.requests===1?'':'s'} · last ${b.quiet_s}s ago`
+  else st=`Running at ${b.baud} baud ${fmts[b.format||1]} · ${b.requests} request${b.requests===1?'':'s'} · last ${b.quiet_s}s ago`
          + (b.writes?` · ${b.writes} write${b.writes===1?'':'s'} refused`:'');
   if(!b.ip) st+=' The IP protocols appear once this board has joined a network.';
+
+  // Communication, for commissioning. Everything here is measured; see
+  // out_modbus.h for why there is no CRC/framing error count -- esp-modbus
+  // drops bad frames inside the stack, and a counter stuck at zero would
+  // read as "healthy" when it means "not counted".
+  const rd=b.rd||[0,0,0,0];
+  $('bus-comms').innerHTML = !b.running ? '' :
+    `<table class="tbl">
+       <tr><th colspan="2">Communication</th></tr>
+       <tr><td>Requests</td><td>${b.requests||0} total · ${b.per_min||0} in the last minute</td></tr>
+       <tr><td>Last request</td><td>${b.quiet_s<0?'never':b.quiet_s+' s ago'}</td></tr>
+       <tr><td>Input regs (FC4)</td><td>${rd[0]}</td></tr>
+       <tr><td>Holding regs (FC3)</td><td>${rd[1]}</td></tr>
+       <tr><td>Discretes (FC2)</td><td>${rd[2]}</td></tr>
+       <tr><td>Coils (FC1)</td><td>${rd[3]}</td></tr>
+       <tr><td>Bus collisions</td><td>${b.collisions||0}${b.collisions?' — check for a duplicate address on the trunk':''}</td></tr>
+       <tr><td>Writes refused</td><td>${b.writes||0}</td></tr>
+       <tr><td>Self-tests started</td><td>${b.tests||0}</td></tr>
+     </table>
+     <p class="note">Counters are since the last restart, not stored. Silence while the trunk's
+       other devices work usually means the baud or data format is wrong; collisions usually mean
+       two devices share an address.</p>`;
   $('bus-stat').textContent=st;
 }
+// Restart, next to the settings that need one. /api/reboot is upstream's and
+// already behind the login; the firmware card's button only appears in some
+// update states, which is no use when you have just changed the baud rate.
+$('bus-reboot').onclick=async()=>{
+  if(!confirm('Restart the board now?
+
+The bus goes quiet for a few seconds. A BMS polling this device will log it as offline.')) return;
+  const r=await api('/api/reboot');
+  toast(r.ok?'Restarting…':(r.error||'failed'));
+};
 $('bus-save').onclick=async()=>{
   const r=await api('/api/bus',{proto:+$('bus-proto').value,
                                 address:+$('bus-addr').value,
-                                baud:+$('bus-baud').value});
+                                baud:+$('bus-baud').value,
+                                format:+$('bus-fmt').value,
+                                cmd:$('bus-cmd').checked});
   if(!r.ok){ toast(r.error||'failed'); return; }
   busBuilt=null; toast('Saved — restart to apply'); poll();
 };
+
+// The register overview. Fetched only while its card is open -- thirty-five
+// values on the one-second status poll would be paid for by every page.
+let ptsTimer=null;
+function ptsRows(d){
+  const esc2=x=>esc(String(x));
+  let h='<table class="tbl"><tr><th>#</th><th>Point</th><th>Raw</th><th>Meaning</th></tr>';
+  h+='<tr><td colspan="4" class="k">Discretes &mdash; FC2, mirrored as coils (FC1)</td></tr>';
+  for(const x of (d.discretes||[])){
+    h+=`<tr><td>${x.a}</td><td>${esc2(x.n)}</td><td>${x.v?1:0}</td><td>${x.v?'true':'false'}</td></tr>`;
+  }
+  h+='<tr><td colspan="4" class="k">Input registers &mdash; FC4, mirrored as holding (FC3)</td></tr>';
+  for(const x of (d.regs||[])){
+    if(x.v===null||x.v===undefined){
+      h+=`<tr><td>${x.a}</td><td class="note">reserved</td><td class="note">absent</td><td class="note">exception 02</td></tr>`;
+      continue;
+    }
+    let mean;
+    if(x.v===65535) mean='not reported';
+    else if(x.u==='V x10') mean=(x.v/10).toFixed(1)+' V';
+    else if(x.u==='%'||x.u==='s'||x.u==='days') mean=x.v+' '+x.u;
+    else if(x.a===7) mean='0b'+x.v.toString(2).padStart(6,'0');
+    else mean='';
+    h+=`<tr><td>${x.a}</td><td>${esc2(x.n)}</td><td>${x.v}</td><td>${esc2(mean)}</td></tr>`;
+  }
+  return h+'</table>';
+}
+async function ptsLoad(){
+  try{
+    const r=await fetch(forUps('/api/points'),{headers:tok?{'X-Auth-Token':tok}:{}});
+    const d=await r.json();
+    $('pts-body').innerHTML=ptsRows(d);
+    $('pts-sum').textContent=d.comm_ok?'UPS link up':'UPS link down — discretes read 0, measurements 65535';
+  }catch(e){ $('pts-body').innerHTML='<p class="note">could not read the points</p>'; }
+}
+$('pts-card').addEventListener('toggle',()=>{
+  if($('pts-card').open){ ptsLoad(); ptsTimer=setInterval(ptsLoad,2000); }
+  else { clearInterval(ptsTimer); ptsTimer=null; }
+});
 
 // The Login card: change the login, or log out. It cannot be turned off.
 let authBuilt=null;

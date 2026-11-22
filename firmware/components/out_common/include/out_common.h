@@ -37,6 +37,10 @@
 #define OUT_ABSENT      65535u
 #define OUT_REG_MAX_REAL 65534u
 
+/* THESE TWO ARE ADDRESSES, NOT CHOICES, so they start at 0 and stay there.
+ * Modbus addressing is 0-based and the other track's map fixes every one of
+ * them; renumbering would move every point at every commissioned site. The
+ * from-1 rule above applies to enums we are free to number. */
 enum {                          /* discrete inputs (FC2), mirrored as coils  */
     OUT_D_ONLINE = 0,
     OUT_D_ON_BATTERY,           /* the one every site alarms on              */
@@ -84,8 +88,11 @@ enum {                          /* input registers (FC4), mirrored as holding */
  * and BACnet/IP were "Ethernet board only", but an RS485 board that joins a
  * Wi-Fi can serve them perfectly well, and one site will. Ask the network,
  * not the part number. */
+/* Numbered from 1, like every choice enum here: a zero-valued member cannot
+ * be told apart from an NVS key that was never written or a JSON field that
+ * was never sent, and both of those happen. */
 typedef enum {
-    OUT_PROTO_NONE = 0,         /* nothing on the bus; the page still works */
+    OUT_PROTO_NONE = 1,         /* nothing on the bus; the page still works */
     OUT_PROTO_MODBUS_RTU,       /* RS485 */
     OUT_PROTO_BACNET_MSTP,      /* RS485 */
     OUT_PROTO_MODBUS_TCP,       /* needs an IP address */
@@ -116,11 +123,31 @@ esp_err_t out_common_set_address(int addr);
 int       out_common_baud(void);
 esp_err_t out_common_set_baud(int baud);
 
+/* Serial framing on the trunk. One setting rather than separate parity and
+ * stop-bit fields: a BMS tool asks for "8N1" and the pair only has four
+ * combinations anyone uses, so splitting them would mostly offer invalid ones.
+ *
+ * 8N1 is the default and what nearly every BMS master is set to. Note that
+ * the Modbus RTU spec actually calls for TWO stop bits when there is no
+ * parity, to keep eleven bits per character -- 8N2 is here for a master that
+ * holds to that, because a device framing 8N1 against a strict 8N2 master
+ * produces frame errors that look exactly like a wrong baud rate. */
+typedef enum {
+    OUT_FMT_8N1 = 1,            /* default */
+    OUT_FMT_8E1,
+    OUT_FMT_8O1,
+    OUT_FMT_8N2,                /* what the Modbus RTU spec asks for */
+} out_fmt_t;
+
+out_fmt_t   out_common_format(void);
+esp_err_t   out_common_set_format(out_fmt_t f);
+const char *out_common_format_name(out_fmt_t f);
+
 /* What register 6 does when the UPS link is lost. */
 typedef enum {
     /* 65535, matching the Python bridge's default and the handover document.
      * Niagara sees the heartbeat stop dead with everything else. */
-    OUT_HB_INVALID = 0,
+    OUT_HB_INVALID = 1,
     /* Keep counting. Lets a site tell "adapter alive, UPS link dead" from
      * "adapter dead", which the first cannot otherwise be distinguished from.
      * Still open with the other track; off until they agree. */
@@ -143,6 +170,16 @@ typedef struct {
     bool     reg_live[OUT_REG_N];
 } out_points_t;
 
+/* Names and units for the page's register overview.
+ *
+ * Here, beside the enums, rather than in the web UI: the table a
+ * commissioning engineer reads off the screen and ticks against the Niagara
+ * point sheet must not be able to drift from the map this file implements.
+ * A reserved address has no name -- it does not exist. */
+const char *out_common_discrete_name(int i);
+const char *out_common_reg_name(int i);
+const char *out_common_reg_unit(int i);     /* "" where unitless */
+
 /* Load settings, seed the boot counter, start the 1 Hz refresh. After
  * ups_hid_start(), like every other consumer. */
 esp_err_t out_common_init(void);
@@ -162,5 +199,21 @@ esp_err_t out_common_set_battery_life_years(int years);
 
 esp_err_t out_common_set_hb_policy(out_hb_policy_t p);
 out_hb_policy_t out_common_hb_policy(void);
+
+/* COMMANDS FROM THE BUS. Off by default, and deliberately so.
+ *
+ * The brief's original rule was "read-only, no UPS commands over
+ * Modbus/BACnet", reversed by Tobias on 2026-11-22 to allow a battery
+ * self-test trigger. The rule existed for a reason that has not gone away:
+ * an RS485 trunk is unauthenticated, a self-test puts the site's load on
+ * battery, and a misconfigured master repeating the write would cycle the
+ * pack. So this is per-board opt-in rather than a build-wide default, and a
+ * board nobody enabled stays read-only exactly as before.
+ *
+ * The command itself carries its own guards in out_modbus: quick test only,
+ * refused unless the UPS's own descriptor reports UPS_CAP_TEST, rate
+ * limited, and logged every time. */
+bool      out_common_cmd_enabled(void);
+esp_err_t out_common_set_cmd_enabled(bool on);
 
 #endif /* GENESIS_OUT_COMMON_H */

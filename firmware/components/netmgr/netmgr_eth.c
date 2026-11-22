@@ -344,6 +344,8 @@ const char *netmgr_ap_ssid(void) { return ""; }
  * netmgr.h is the one header both implementations answer to. */
 void netmgr_ap_reopen(void) { }
 int  netmgr_ap_window_left_s(void) { return -1; }
+bool netmgr_ap_always_on(void) { return false; }
+esp_err_t netmgr_set_ap_always_on(bool on) { (void)on; return ESP_ERR_NOT_SUPPORTED; }
 const char *netmgr_ssid(void) { return ""; }
 int netmgr_rssi(void) { return 0; }
 int netmgr_scan(netmgr_ap_t *out, int max) { return -1; }

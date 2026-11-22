@@ -16,4 +16,18 @@ config UPSA_FLEET_KEY
         firmware, so it must only be able to call heartbeat(): see
         telemetry/supabase.sql. Never the service_role key.
 
+config UPSA_FLEET_DISABLED
+    bool "Never start the check-in at all"
+    default n
+    help
+        Stronger than leaving the endpoint empty. With no URL the task still
+        runs and finds nothing to do, costing a 6 KB stack for a feature that
+        will never be used; with this set, fleet_start() returns before
+        creating it.
+
+        For a deployment that has decided it does not want fleet reporting at
+        all, rather than one that has not configured it yet. The page reports
+        it as not configured either way, and nothing can turn it on without a
+        rebuild.
+
 endmenu

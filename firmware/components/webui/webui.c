@@ -359,17 +359,25 @@ static esp_err_t get_status(httpd_req_t *req)
         out_modbus_stat_t mb;
         out_modbus_get(&mb);
         n += snprintf(AT(n), ROOM(n),
-                  ",\"bus\":{\"proto\":%d,\"address\":%d,\"baud\":%d,"
+                  ",\"bus\":{\"proto\":%d,\"address\":%d,\"baud\":%d,\"format\":%d,"
                   "\"rs485\":%s,\"ip\":%s,\"running\":%s,"
-                  "\"requests\":%u,\"writes\":%u,\"quiet_s\":%lld}",
+                  "\"requests\":%u,\"writes\":%u,\"quiet_s\":%lld,"
+                  "\"per_min\":%u,\"collisions\":%u,\"tests\":%u,"
+                  "\"rd\":[%u,%u,%u,%u],\"cmd\":%s}",
                   (int)out_common_proto(), out_common_address(), out_common_baud(),
+                  (int)out_common_format(),
                   BOARD_HAS_RS485 ? "true" : "false",
                   netmgr_state() == NETMGR_STA_CONNECTED ? "true" : "false",
                   mb.running ? "true" : "false",
                   (unsigned)mb.requests, (unsigned)mb.writes_refused,
                   mb.last_request_us
                       ? (long long)((esp_timer_get_time() - mb.last_request_us) / 1000000)
-                      : -1LL);
+                      : -1LL,
+                  (unsigned)mb.per_min, (unsigned)mb.collisions,
+                  (unsigned)mb.tests_started,
+                  (unsigned)mb.rd_input, (unsigned)mb.rd_holding,
+                  (unsigned)mb.rd_discrete, (unsigned)mb.rd_coil,
+                  out_common_cmd_enabled() ? "true" : "false");
     }
 #if CONFIG_UPSA_TAILSCALE
     /* Present only in a Tailscale build, so the page can tell "not in this
@@ -1172,6 +1180,56 @@ static esp_err_t post_ota_install(httpd_req_t *req)
                            HTTPD_RESP_USE_STRLEN);
 }
 
+/* GET /api/points -- every address this device serves, with what it reads
+ * right now.
+ *
+ * The commissioning view: an engineer ticks this against the Niagara point
+ * sheet instead of guessing. RAW values, because raw is what a BMS reads --
+ * register 3 showing 2401 is how you confirm Niagara renders 240.1 V.
+ *
+ * Its own endpoint rather than part of /api/status: thirty-five values on
+ * every one-second poll would be paid for by every page, and this one is
+ * fetched only while its card is open. Sent in chunks so it needs no buffer
+ * big enough to hold the lot.
+ *
+ * A reserved address appears with a null value and no name. That is the
+ * point of showing it: absent is a different answer from 65535, and this is
+ * where a site can see which is which. */
+static esp_err_t get_points(httpd_req_t *req)
+{
+    if (!may_read(req)) return ESP_OK;
+    out_points_t p;
+    out_common_get(&p);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr_chunk(req, "{\"ok\":true,\"comm_ok\":");
+    httpd_resp_sendstr_chunk(req, p.comm_ok ? "true" : "false");
+    httpd_resp_sendstr_chunk(req, ",\"discretes\":[");
+    for (int i = 0; i < OUT_DISCRETE_N; i++) {
+        char b[112];
+        snprintf(b, sizeof(b), "%s{\"a\":%d,\"n\":\"%s\",\"v\":%s}",
+                 i ? "," : "", i, out_common_discrete_name(i),
+                 p.discrete[i] ? "true" : "false");
+        httpd_resp_sendstr_chunk(req, b);
+    }
+    httpd_resp_sendstr_chunk(req, "],\"regs\":[");
+    for (int i = 0; i < OUT_REG_N; i++) {
+        char b[144];
+        if (p.reg_live[i]) {
+            snprintf(b, sizeof(b), "%s{\"a\":%d,\"n\":\"%s\",\"u\":\"%s\",\"v\":%u}",
+                     i ? "," : "", i, out_common_reg_name(i),
+                     out_common_reg_unit(i), (unsigned)p.reg[i]);
+        } else {
+            snprintf(b, sizeof(b), "%s{\"a\":%d,\"n\":\"\",\"u\":\"\",\"v\":null}",
+                     i ? "," : "", i);
+        }
+        httpd_resp_sendstr_chunk(req, b);
+    }
+    httpd_resp_sendstr_chunk(req, "]}");
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
+}
+
 /* POST /api/ota/upload -- the firmware image itself as the request body.
  *
  * The update path for a board that will never reach the internet, which is
@@ -1260,6 +1318,14 @@ static esp_err_t post_bus(httpd_req_t *req)
         why = "address must be 1-127 (valid for both Modbus and MS/TP)";
     } else if (cJSON_IsNumber(jb) && (e = out_common_set_baud(jb->valueint)) != ESP_OK) {
         why = "baud must be 0 (auto), 9600, 19200, 38400, 57600, 76800 or 115200";
+    } else if (cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive(root, "format")) &&
+               (e = out_common_set_format(
+                    (out_fmt_t)cJSON_GetObjectItemCaseSensitive(root, "format")->valueint)) != ESP_OK) {
+        why = "data format must be 8N1, 8E1, 8O1 or 8N2";
+    } else if (cJSON_IsBool(cJSON_GetObjectItemCaseSensitive(root, "cmd")) &&
+               (e = out_common_set_cmd_enabled(
+                    cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "cmd")))) != ESP_OK) {
+        why = "could not save the command setting";
     } else if (cJSON_IsNumber(jp)) {
         int p = jp->valueint;
         if ((p == OUT_PROTO_MODBUS_RTU || p == OUT_PROTO_BACNET_MSTP) && !BOARD_HAS_RS485) {
@@ -1889,9 +1955,9 @@ static esp_err_t route(httpd_req_t *req)
 #else
 #define ROUTES_TLS 0
 #endif
-/* 32, not 30: /api/ota/upload and /api/bus are ours (local firmware upload for a board with
+/* 33, not 30: /api/ota/upload, /api/bus and /api/points are ours (local firmware upload for a board with
  * no route to GitHub). The static assert below is what caught the omission. */
-#define ROUTE_COUNT (32 + ROUTES_TAILSCALE + ROUTES_OUTAGELOG + ROUTES_HISTORY + ROUTES_TLS)
+#define ROUTE_COUNT (33 + ROUTES_TAILSCALE + ROUTES_OUTAGELOG + ROUTES_HISTORY + ROUTES_TLS)
 
 /* Order matters: the server tries these in turn and the wildcard route
  * matches everything, so it has to be last or it swallows the API. */
@@ -1910,6 +1976,7 @@ static const struct { const char *uri; httpd_method_t method; handler_fn fn; } R
     { "/api/ota/install",      HTTP_POST, post_ota_install },
     { "/api/ota/upload",       HTTP_POST, post_ota_upload },
     { "/api/bus",              HTTP_POST, post_bus },
+    { "/api/points",           HTTP_GET,  get_points },
     { "/api/ota/auto",         HTTP_POST, post_ota_auto },
     { "/api/fleet",            HTTP_POST, post_fleet },
     { "/api/fleet/descriptor", HTTP_POST, post_fleet_descriptor },
