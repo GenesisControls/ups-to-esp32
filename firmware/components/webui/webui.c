@@ -332,7 +332,8 @@ static esp_err_t get_status(httpd_req_t *req)
                   "\"fleet\":{\"configured\":%s,\"enabled\":%s,\"stats\":%s,\"stats_auto\":%s,"
                   "\"channel\":\"%s\",\"sent\":%u,\"last_ok\":%lld,\"error\":\"%s\","
                   "\"desc\":\"%s\"},"
-                  "\"auth\":{\"enabled\":%s}",
+                  "\"auth\":{\"enabled\":%s,\"default\":%s},"
+                  "\"setup_screen\":%s",
                   f.configured ? "true" : "false", f.enabled ? "true" : "false",
                   f.stats ? "true" : "false", f.stats_auto ? "true" : "false",
                   jesc(f.channel, e2, sizeof(e2)),
@@ -340,7 +341,13 @@ static esp_err_t get_status(httpd_req_t *req)
                   (long long)(f.last_ok_s < 0 ? -1 : now_s - f.last_ok_s),
                   jesc(f.last_error, e1, sizeof(e1)),
                   jesc(desc_res, e3, sizeof(e3)),
-                  auth_enabled() ? "true" : "false");
+                  auth_enabled() ? "true" : "false",
+                  auth_is_default() ? "true" : "false",
+#if CONFIG_UPSA_SETUP_SCREEN
+                  "true");
+#else
+                  "false");
+#endif
 #if CONFIG_UPSA_TAILSCALE
     /* Present only in a Tailscale build, so the page can tell "not in this
      * firmware" from "off". key_set, never the key: this JSON is served to
@@ -853,12 +860,22 @@ static esp_err_t post_wifi(httpd_req_t *req)
         cJSON_Delete(root);
         return send_err(req, "choose a username and password for this board");
     }
-    /* Everything else is checked before the login is committed: it is saved
+    /* A NETWORK NAME IS OPTIONAL ON THIS BUILD. Upstream requires one here,
+     * and is right to: for upstream the network IS the product -- NUT on
+     * 3493, Home Assistant, Prometheus. For this adapter it is the exception.
+     * The output that matters is RS485, the radio exists so a technician can
+     * configure the board, and roughly one deployment in twenty ever joins a
+     * network (to carry Modbus TCP or BACnet/IP over Wi-Fi).
+     *
+     * So a save with no SSID is valid: it stores the login and leaves the
+     * board on its own AP. Static IP settings are not applied on this path --
+     * they only mean anything once the board joins something, and /api/network
+     * is where they belong.
+     *
+     * Everything else is checked before the login is committed: it is saved
      * once, so a retry with a corrected form would be silently ignored. */
-    if (!cJSON_IsString(ssid) || !ssid->valuestring[0]) {
-        cJSON_Delete(root);
-        return send_err(req, "a network name is required");
-    }
+    const bool want_wifi = cJSON_IsString(ssid) && ssid->valuestring[0];
+
     bool made_login = false;
     if (au && au[0] && !auth_enabled()) {
         esp_err_t aerr = auth_set_credentials(au, ap);
@@ -875,6 +892,18 @@ static esp_err_t post_wifi(httpd_req_t *req)
     }
 
     bool setup = netmgr_state() == NETMGR_AP_PROVISIONING;
+
+    /* No network asked for: the login is already saved, the board stays on
+     * its own access point and nothing restarts. Not an error -- it is the
+     * normal outcome for this product. */
+    if (!want_wifi) {
+        cJSON_Delete(root);
+        ESP_LOGI(TAG, "setup saved with no network: staying on the access point");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_send(req, "{\"ok\":true,\"no_wifi\":true}",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+
     esp_err_t err = netmgr_provision(ssid->valuestring,
                                      cJSON_IsString(pass) ? pass->valuestring : "", &ip);
     cJSON_Delete(root);
@@ -1118,6 +1147,68 @@ static esp_err_t post_ota_install(httpd_req_t *req)
     return httpd_resp_send(req, err == ESP_OK ? "{\"ok\":true}"
                            : "{\"ok\":false,\"error\":\"busy\"}",
                            HTTPD_RESP_USE_STRLEN);
+}
+
+/* POST /api/ota/upload -- the firmware image itself as the request body.
+ *
+ * The update path for a board that will never reach the internet, which is
+ * most of them: a laptop on the board's own access point and a .bin file.
+ * /api/ota/install fetches from GitHub and is no use without a route to it.
+ *
+ * Raw bytes, not multipart. A multipart parser here would be attacker-shaped
+ * input immediately upstream of the flash writer, for no gain: the page can
+ * send the File object as the body just as easily. Content-Length is required
+ * so the size can be checked before the slot is opened and so there is
+ * something to show a progress bar.
+ *
+ * Every safety check lives in ota_upload_*(), alongside the download's. */
+static esp_err_t post_ota_upload(httpd_req_t *req)
+{
+    if (!may_write(req)) return ESP_OK;
+    if (req->content_len <= 0) return send_err(req, "no firmware image in the request");
+
+    char err[128] = "";
+    ota_upload_t *u = NULL;
+    if (ota_upload_begin(&u, (size_t)req->content_len, err, sizeof(err)) != ESP_OK) {
+        return send_err(req, err[0] ? err : "could not start the update");
+    }
+
+    /* Off the stack: this runs on an httpd worker and the flash writer below
+     * it is the deepest call this server makes. */
+    enum { UP_BUF = 4096 };
+    char *buf = malloc(UP_BUF);
+    if (!buf) { ota_upload_abort(u); return send_err(req, "out of memory"); }
+
+    size_t left = (size_t)req->content_len;
+    int stalls = 0;
+    esp_err_t rc = ESP_OK;
+    while (left) {
+        int r = httpd_req_recv(req, buf, left < UP_BUF ? left : UP_BUF);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            /* A phone on a weak access point stalls and comes back; a peer
+             * that has gone away does not. Allow a few, then stop rather than
+             * hold the UPS link muted waiting for someone who left. */
+            if (++stalls <= 10) continue;
+            strlcpy(err, "the upload stalled", sizeof(err));
+            rc = ESP_FAIL; break;
+        }
+        if (r <= 0) {
+            strlcpy(err, "the upload was cut short", sizeof(err));
+            rc = ESP_FAIL; break;
+        }
+        stalls = 0;
+        if ((rc = ota_upload_chunk(u, buf, (size_t)r, err, sizeof(err))) != ESP_OK) break;
+        left -= (size_t)r;
+    }
+    free(buf);
+
+    if (rc == ESP_OK) rc = ota_upload_finish(u, err, sizeof(err));
+    ota_upload_abort(u);        /* always, success included: see ota.h */
+
+    if (rc != ESP_OK) return send_err(req, err[0] ? err : "the image was refused");
+    ESP_LOGW(TAG, "firmware uploaded from the page; waiting for a restart");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true,\"installed\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
 /* Turns the periodic CHECK on or off. There is deliberately no equivalent for
@@ -1732,7 +1823,9 @@ static esp_err_t route(httpd_req_t *req)
 #else
 #define ROUTES_TLS 0
 #endif
-#define ROUTE_COUNT (30 + ROUTES_TAILSCALE + ROUTES_OUTAGELOG + ROUTES_HISTORY + ROUTES_TLS)
+/* 31, not 30: /api/ota/upload is ours (local firmware upload for a board with
+ * no route to GitHub). The static assert below is what caught the omission. */
+#define ROUTE_COUNT (31 + ROUTES_TAILSCALE + ROUTES_OUTAGELOG + ROUTES_HISTORY + ROUTES_TLS)
 
 /* Order matters: the server tries these in turn and the wildcard route
  * matches everything, so it has to be last or it swallows the API. */
@@ -1749,6 +1842,7 @@ static const struct { const char *uri; httpd_method_t method; handler_fn fn; } R
     { "/api/ota/notes",        HTTP_GET,  get_ota_notes },
     { "/api/ota/check",        HTTP_POST, post_ota_check },
     { "/api/ota/install",      HTTP_POST, post_ota_install },
+    { "/api/ota/upload",       HTTP_POST, post_ota_upload },
     { "/api/ota/auto",         HTTP_POST, post_ota_auto },
     { "/api/fleet",            HTTP_POST, post_fleet },
     { "/api/fleet/descriptor", HTTP_POST, post_fleet_descriptor },

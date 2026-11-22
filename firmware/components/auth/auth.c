@@ -20,6 +20,19 @@ static const char *TAG = "auth";
 #define KEY_USER    "auth_user"
 #define KEY_SALT    "auth_salt"
 #define KEY_HASH    "auth_hash"
+/* Set alongside the credentials when auth_init() seeded the compiled-in
+ * default; cleared the moment anyone sets a login of their own. Kept in NVS
+ * rather than in RAM so the notice survives a restart. */
+#define KEY_DEFAULT "auth_dflt"
+
+/* Empty unless the build sets them; see components/auth/Kconfig.projbuild.
+ * Defined here too so this file still compiles if that Kconfig is absent. */
+#ifndef CONFIG_UPSA_DEFAULT_ADMIN_USER
+#define CONFIG_UPSA_DEFAULT_ADMIN_USER ""
+#endif
+#ifndef CONFIG_UPSA_DEFAULT_ADMIN_PASS
+#define CONFIG_UPSA_DEFAULT_ADMIN_PASS ""
+#endif
 
 /* Salted and iterated, so a copy of the flash does not hand over a password
  * people may use elsewhere. The S3 hashes in hardware: 4096 rounds is a few
@@ -28,6 +41,7 @@ static const char *TAG = "auth";
 
 static authc_t s_a;
 static SemaphoreHandle_t s_lock;
+static bool s_default;          /* the login is still the compiled-in default */
 
 static void hash_pass(const uint8_t salt[AUTH_SALT_LEN], const char *pass,
                       uint8_t out[AUTH_HASH_LEN])
@@ -70,25 +84,51 @@ uint32_t auth_src_of_fd(int fd)
 
 static int64_t now_us(void) { return esp_timer_get_time(); }
 
+static esp_err_t set_creds(const char *user, const char *pass, bool is_default);
+
 esp_err_t auth_init(void)
 {
     s_lock = xSemaphoreCreateMutex();
     if (!s_lock) return ESP_ERR_NO_MEM;
     memset(&s_a, 0, sizeof(s_a));
 
+    /* The namespace is absent on a board that has never written to it. That
+     * is not an error, and -- unlike before -- not a reason to return early:
+     * the default login below has to be seeded on exactly that board. */
     nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return ESP_OK;   /* nothing saved */
-    char user[AUTH_USER_MAX + 1] = "";
-    uint8_t salt[AUTH_SALT_LEN], hash[AUTH_HASH_LEN];
-    size_t ul = sizeof(user), sl = sizeof(salt), hl = sizeof(hash);
-    if (nvs_get_str(h, KEY_USER, user, &ul) == ESP_OK &&
-        nvs_get_blob(h, KEY_SALT, salt, &sl) == ESP_OK && sl == AUTH_SALT_LEN &&
-        nvs_get_blob(h, KEY_HASH, hash, &hl) == ESP_OK && hl == AUTH_HASH_LEN && user[0]) {
-        authc_set(&s_a, user, salt, hash);
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        char user[AUTH_USER_MAX + 1] = "";
+        uint8_t salt[AUTH_SALT_LEN], hash[AUTH_HASH_LEN];
+        size_t ul = sizeof(user), sl = sizeof(salt), hl = sizeof(hash);
+        if (nvs_get_str(h, KEY_USER, user, &ul) == ESP_OK &&
+            nvs_get_blob(h, KEY_SALT, salt, &sl) == ESP_OK && sl == AUTH_SALT_LEN &&
+            nvs_get_blob(h, KEY_HASH, hash, &hl) == ESP_OK && hl == AUTH_HASH_LEN && user[0]) {
+            authc_set(&s_a, user, salt, hash);
+            uint8_t d = 0;
+            if (nvs_get_u8(h, KEY_DEFAULT, &d) == ESP_OK) s_default = d != 0;
+        }
+        nvs_close(h);
     }
-    nvs_close(h);
-    ESP_LOGI(TAG, "login %s", authc_enabled(&s_a) ? "ON: changes need a username and password"
-                                                  : "off (optional; set one on the web page)");
+
+    /* A build may ship a login so the board is usable the moment it powers up
+     * and the setup page need not insist on one. ONLY when nothing is stored:
+     * a login someone chose is never overwritten, and once they change the
+     * default this stops firing because a login then exists. */
+    if (!authc_enabled(&s_a) && CONFIG_UPSA_DEFAULT_ADMIN_USER[0]) {
+        esp_err_t serr = set_creds(CONFIG_UPSA_DEFAULT_ADMIN_USER,
+                                   CONFIG_UPSA_DEFAULT_ADMIN_PASS, true);
+        if (serr == ESP_OK) {
+            ESP_LOGW(TAG, "seeded the built-in default login (user '%s') -- "
+                          "change the password on the web page",
+                     CONFIG_UPSA_DEFAULT_ADMIN_USER);
+        } else {
+            ESP_LOGE(TAG, "could not seed the default login: %s", esp_err_to_name(serr));
+        }
+    }
+
+    ESP_LOGI(TAG, "login %s%s", authc_enabled(&s_a) ? "ON: changes need a username and password"
+                                                    : "off (optional; set one on the web page)",
+             s_default ? " (still the built-in default)" : "");
     return ESP_OK;
 }
 
@@ -100,7 +140,7 @@ bool auth_enabled(void)
     return on;
 }
 
-esp_err_t auth_set_credentials(const char *user, const char *pass)
+static esp_err_t set_creds(const char *user, const char *pass, bool is_default)
 {
     bool clear = !user || !user[0];
     if (!clear && !authc_shape_ok(user, pass)) return ESP_ERR_INVALID_ARG;
@@ -118,10 +158,12 @@ esp_err_t auth_set_credentials(const char *user, const char *pass)
         nvs_erase_key(h, KEY_USER);
         nvs_erase_key(h, KEY_SALT);
         nvs_erase_key(h, KEY_HASH);
+        nvs_erase_key(h, KEY_DEFAULT);
     } else {
         nvs_set_str(h, KEY_USER, user);
         nvs_set_blob(h, KEY_SALT, salt, sizeof(salt));
         nvs_set_blob(h, KEY_HASH, hash, sizeof(hash));
+        nvs_set_u8(h, KEY_DEFAULT, is_default ? 1 : 0);
     }
     err = nvs_commit(h);
     nvs_close(h);
@@ -129,9 +171,25 @@ esp_err_t auth_set_credentials(const char *user, const char *pass)
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     authc_set(&s_a, clear ? "" : user, salt, hash);     /* also logs everyone out */
+    s_default = !clear && is_default;
     xSemaphoreGive(s_lock);
     ESP_LOGI(TAG, "login %s", clear ? "turned off" : "set");
     return ESP_OK;
+}
+
+/* Anything a person sets is by definition not the built-in default, so this
+ * clears the flag. auth_init() is the only caller that ever sets it. */
+esp_err_t auth_set_credentials(const char *user, const char *pass)
+{
+    return set_creds(user, pass, false);
+}
+
+bool auth_is_default(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool d = s_default && authc_enabled(&s_a);
+    xSemaphoreGive(s_lock);
+    return d;
 }
 
 static auth_result_t from_core(authc_result_t r)

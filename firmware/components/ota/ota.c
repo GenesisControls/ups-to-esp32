@@ -21,6 +21,7 @@
 #include "nvs.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <ctype.h>
 
 static const char *TAG = "ota";
@@ -664,6 +665,217 @@ static void do_install(void)
 void ota_set_quiet_hook(esp_err_t (*hook)(bool quiet))
 {
     s_quiet_hook = hook;
+}
+
+/* ---- Local upload -------------------------------------------------------
+ *
+ * The same install as do_install(), fed from an HTTP request body. See ota.h
+ * for why it exists: most of these adapters never join a network, so GitHub
+ * is not reachable from them and a laptop on the board's own access point is
+ * the only machine that will ever update one.
+ *
+ * It takes the same precautions, in the same order, because getting any of
+ * them wrong is how a board in a cabinet becomes a site visit:
+ *   - refuse while the running image is itself on trial;
+ *   - write only to the slot that is NOT running;
+ *   - read the image's own descriptor and refuse a foreign board BEFORE the
+ *     first byte is committed;
+ *   - keep the UPS's USB quiet for the whole write;
+ *   - leave the new image to boot on trial, so the bootloader can roll back.
+ */
+
+/* An app image carries its descriptor at a fixed 0x20: the image header then
+ * the first segment header. Holding that many bytes back is what lets the
+ * identity check happen before anything is written. */
+#define UP_DESC_OFF  32u
+#define UP_HDR_LEN   (UP_DESC_OFF + sizeof(esp_app_desc_t))
+
+struct ota_upload {
+    esp_ota_handle_t       h;
+    bool                   h_open;
+    const esp_partition_t *part;
+    size_t                 total;        /* announced by the request, 0 if unknown */
+    size_t                 written;
+    uint8_t                hdr[UP_HDR_LEN];
+    size_t                 hdr_n;
+    bool                   identified;
+    bool                   quiet;        /* we asked for USB silence and owe a release */
+};
+
+/* Give back everything except the esp_ota handle, which each path closes in
+ * the way that suits it (abort on failure, end on success). */
+static void up_release(ota_upload_t *u)
+{
+    if (!u) return;
+    if (u->quiet && s_quiet_hook) s_quiet_hook(false);
+    free(u);
+}
+
+/* Fail without freeing: the caller still owns the handle and must call
+ * ota_upload_abort(), which keeps one cleanup path rather than two. */
+static esp_err_t up_err(ota_upload_t *u, char *err, size_t cap, const char *why)
+{
+    if (u->h_open) { esp_ota_abort(u->h); u->h_open = false; }
+    strlcpy(err, why, cap);
+    set_state(OTA_FAILED, why);
+    return ESP_FAIL;
+}
+
+void ota_upload_abort(ota_upload_t *u)
+{
+    if (!u) return;
+    if (u->h_open) esp_ota_abort(u->h);
+    up_release(u);
+}
+
+esp_err_t ota_upload_begin(ota_upload_t **out, size_t total, char *err, size_t cap)
+{
+    *out = NULL;
+
+    /* The refusal esp_https_ota_begin() makes for the download, made here too:
+     * the spare slot currently holds the image we would roll back TO, and
+     * overwriting it while this one is unproven leaves no way home. */
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    esp_ota_img_states_t ist;
+    if (run && esp_ota_get_state_partition(run, &ist) == ESP_OK &&
+        ist == ESP_OTA_IMG_PENDING_VERIFY) {
+        strlcpy(err, "this firmware is still on trial; let it settle or restart first", cap);
+        return ESP_FAIL;
+    }
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool busy = s_st.state == OTA_CHECKING || s_st.state == OTA_DOWNLOADING;
+    xSemaphoreGive(s_lock);
+    if (busy) { strlcpy(err, "an update is already running", cap); return ESP_FAIL; }
+
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (!part) { strlcpy(err, "this board has no spare firmware slot", cap); return ESP_FAIL; }
+    if (total && total > part->size) {
+        snprintf(err, cap, "that image is %u bytes and the slot holds %u",
+                 (unsigned)total, (unsigned)part->size);
+        return ESP_FAIL;
+    }
+
+    ota_upload_t *u = calloc(1, sizeof(*u));
+    if (!u) { strlcpy(err, "out of memory", cap); return ESP_FAIL; }
+    u->part  = part;
+    u->total = total;
+
+    /* Before any flash write, for the reason in do_install(): v0.14.4 panicked
+     * in the USB host driver every time it wrote an image with a UPS attached. */
+    if (s_quiet_hook) {
+        if (s_quiet_hook(true) != ESP_OK) {
+            ESP_LOGW(TAG, "UPS USB would not go quiet; uploading anyway");
+        }
+        u->quiet = true;
+    }
+
+    esp_err_t e = esp_ota_begin(part, OTA_WITH_SEQUENTIAL_WRITES, &u->h);
+    if (e != ESP_OK) {
+        snprintf(err, cap, "could not open the spare slot: %s", esp_err_to_name(e));
+        up_release(u);
+        return ESP_FAIL;
+    }
+    u->h_open = true;
+
+    set_state(OTA_DOWNLOADING, NULL);
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_st.progress = 0;
+    xSemaphoreGive(s_lock);
+    ESP_LOGI(TAG, "upload: writing to %s, %u bytes announced",
+             part->label, (unsigned)total);
+    *out = u;
+    return ESP_OK;
+}
+
+esp_err_t ota_upload_chunk(ota_upload_t *u, const void *data, size_t len,
+                           char *err, size_t cap)
+{
+    if (!u || !u->h_open) { strlcpy(err, "the upload is not open", cap); return ESP_FAIL; }
+    const uint8_t *p = data;
+
+    if (!u->identified) {
+        size_t want = UP_HDR_LEN - u->hdr_n;
+        size_t take = len < want ? len : want;
+        memcpy(u->hdr + u->hdr_n, p, take);
+        u->hdr_n += take; p += take; len -= take;
+        if (u->hdr_n < UP_HDR_LEN) return ESP_OK;         /* still buffering */
+
+        esp_app_desc_t d;
+        memcpy(&d, u->hdr + UP_DESC_OFF, sizeof(d));
+        if (d.magic_word != ESP_APP_DESC_MAGIC_WORD) {
+            return up_err(u, err, cap, "that file is not an ESP32 firmware image");
+        }
+        /* The check the download makes, and for the same reason: a correctly
+         * named file containing the wrong build is exactly what shipped once. */
+        if (strncmp(d.project_name, BOARD_IMAGE_NAME, sizeof(d.project_name)) != 0) {
+            char why[96];
+            snprintf(why, sizeof(why), "that image is \"%.32s\"; this board runs \"%s\"",
+                     d.project_name, BOARD_IMAGE_NAME);
+            ESP_LOGE(TAG, "upload REFUSED: %s", why);
+            return up_err(u, err, cap, why);
+        }
+        ESP_LOGI(TAG, "upload: accepted \"%.32s\" version \"%.32s\"",
+                 d.project_name, d.version);
+
+        if (esp_ota_write(u->h, u->hdr, UP_HDR_LEN) != ESP_OK) {
+            return up_err(u, err, cap, "could not write to the spare slot");
+        }
+        u->written    = UP_HDR_LEN;
+        u->identified = true;
+    }
+
+    if (len) {
+        if (esp_ota_write(u->h, p, len) != ESP_OK) {
+            return up_err(u, err, cap, "could not write to the spare slot");
+        }
+        u->written += len;
+    }
+    if (u->total) {
+        int pc = (int)((uint64_t)u->written * 100 / u->total);
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        s_st.progress = pc > 100 ? 100 : pc;
+        xSemaphoreGive(s_lock);
+    }
+    return ESP_OK;
+}
+
+esp_err_t ota_upload_finish(ota_upload_t *u, char *err, size_t cap)
+{
+    if (!u || !u->h_open) { strlcpy(err, "the upload is not open", cap); return ESP_FAIL; }
+    if (!u->identified) {
+        return up_err(u, err, cap, "the file ended before its identity could be read");
+    }
+
+    /* Also verifies the image, and its signature where the build asks for one
+     * (sdkconfig.defaults.signed). */
+    esp_err_t e = esp_ota_end(u->h);
+    u->h_open = false;
+    if (e != ESP_OK) {
+        if (e == ESP_ERR_OTA_VALIDATE_FAILED) {
+            strlcpy(err, "the image failed its own validity check", cap);
+        } else {
+            snprintf(err, cap, "could not finish the write: %s", esp_err_to_name(e));
+        }
+        set_state(OTA_FAILED, err);
+        return ESP_FAIL;
+    }
+
+    e = esp_ota_set_boot_partition(u->part);
+    if (e != ESP_OK) {
+        snprintf(err, cap, "could not select the new image: %s", esp_err_to_name(e));
+        set_state(OTA_FAILED, err);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGW(TAG, "upload: %u bytes installed to %s; restart to run it",
+             (unsigned)u->written, u->part->label);
+    set_state(OTA_INSTALLED, NULL);
+    /* Deliberately NOT freed here. The caller frees with ota_upload_abort()
+     * on every path, success included: one rule is harder to get wrong than
+     * "free on failure, but not after a successful finish", which is a
+     * use-after-free waiting for whoever writes the second caller. */
+    return ESP_OK;
 }
 
 bool ota_tls_take(uint32_t wait_ms)

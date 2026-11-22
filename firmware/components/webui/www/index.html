@@ -441,9 +441,12 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
       <summary><span class="k">Wi-Fi</span><span id="wifi-sum"> </span></summary>
       <div id="setup-banner">
         <h2>Connect this board to your Wi-Fi</h2>
-        <p class="note" id="setup-intro">It has no network yet. Choose yours and this page will
-          show you the board's address on it. Until then you are connected to
-          <b id="apname">its own access point</b>.</p>
+        <p class="note" id="setup-intro">Wi-Fi is optional. Most adapters never join one: the
+          radio is here so you can configure the board, and the UPS data leaves over RS485.
+          Leave the network fields blank and press Save to carry on using
+          <b id="apname">its own access point</b>. Choose a network only if this board is one of
+          the few that carries its data over Wi-Fi — this page will then show you its address
+          there.</p>
       </div>
       <div id="join"></div>
       <div id="wifi-form">
@@ -481,7 +484,7 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
         <label for="su-pass2">Password again</label>
         <input id="su-pass2" type="password" autocomplete="new-password">
       </div>
-      <button class="btn pri" id="save">Save and connect</button>
+      <button class="btn pri" id="save">Save</button>
       </div>
     </details>
 
@@ -556,11 +559,27 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
 
     <div class="gh" id="fw-home"><span class="k">Firmware</span><i></i></div>
     <div id="fw"></div>
+    <details class="card" id="fwup-card">
+      <summary><span class="k">Install firmware from a file</span></summary>
+      <p class="note">For a board with no route to the internet, which is most of them. Pick a
+        <code>.bin</code> built for this board and it is written straight to the spare slot over
+        this connection — no GitHub, no LAN needed. The board reads the image's own identity and
+        refuses one built for a different board before it writes anything, and if the new
+        firmware fails to come back the bootloader reverts to this one by itself. Nothing
+        restarts until you ask it to.</p>
+      <input type="file" id="fwup-file" accept=".bin,application/octet-stream">
+      <button class="btn" id="fwup-go">Upload and install</button>
+      <p class="note" id="fwup-stat"></p>
+    </details>
     <div id="fleet"></div>
 
     <div class="gh"><span class="k">Settings</span><i></i></div>
     <details class="card" id="auth-card">
       <summary><span class="k">Login</span><span id="auth-sum"> </span></summary>
+      <p class="note" id="pw-default" hidden><b>This board still has its built-in default
+        password.</b> That password ships with the firmware and is public, so anyone who can
+        reach this board can change its settings. Setting your own below is recommended — but
+        it is not required, and the board works either way.</p>
       <p class="note" id="auth-explain"></p>
       <label for="au-old" id="au-old-l">Current password</label>
       <input id="au-old" type="password" autocomplete="current-password">
@@ -1730,7 +1749,12 @@ async function poll(){
       `${host}:${nut.port||3493} · ` + (cl ? `${cl} client${cl===1?'':'s'} connected` : 'no clients yet');
 
     const w=s.wifi;
-    const setup=w.state===PROVISIONING, card=$('wifi-card');
+    // The guided setup screen hides every other card until the board joins a
+    // network. Right when the network is the product; wrong when it is
+    // optional, because a board that never joins one would sit behind a Wi-Fi
+    // form for its whole service life. CONFIG_UPSA_SETUP_SCREEN turns it off,
+    // and the page then comes up normally on the board's own access point.
+    const setup=w.state===PROVISIONING && s.setup_screen!==false, card=$('wifi-card');
     card.hidden=!!w.wired;      // a board on a cable has no Wi-Fi to show
     authUI(s.auth||{}, setup);
     if(document.body.classList.contains('setup')!==setup){
@@ -2022,8 +2046,10 @@ $('dbg-copy').onclick=async()=>{
 };
 
 $('save').onclick=async()=>{
+  // Wi-Fi is optional on this build: an empty SSID saves the login and leaves
+  // the board on its own access point, which is what most of these adapters do
+  // for their whole life. The server treats a missing network name the same way.
   const ssid=$('ssid').value.trim()||$('nets').value;
-  if(!ssid){ toast('Pick a network, or type its name'); return; }
   $('save').disabled=true;
   let r;
   try{
@@ -2039,6 +2065,8 @@ $('save').onclick=async()=>{
     if(r.ok && body.admin_user) await login(body.admin_user,body.admin_pass);
   }catch(e){ r={ok:false,error:NOREACH()}; }
   if(!r.ok){ toast(r.error||'failed'); $('save').disabled=false; return; }
+  // Saved with no network: nothing joins and nothing restarts.
+  if(r.no_wifi){ $('save').disabled=false; toast('Saved. Staying on this access point.'); poll(); return; }
   if(r.joining){ joinBuilt=''; poll(); return; }
   // Moving an already-connected board: it restarts, and this page is reached
   // over the network it is leaving.
@@ -2049,12 +2077,37 @@ $('reset').onclick=async()=>{
   const r=await api('/api/ups/reset');
   toast(r.ok?'UPS link power-cycled':(r.error||'failed'));
 };
+// Local firmware upload. The file IS the body -- api() sends JSON, so this
+// posts by hand, carrying the same auth token. See post_ota_upload() for why
+// it is raw bytes rather than multipart.
+if($('fwup-go')) $('fwup-go').onclick=async()=>{
+  const f=$('fwup-file').files&&$('fwup-file').files[0];
+  if(!f){ toast('Choose a .bin file first'); return; }
+  if(!confirm(`Install ${f.name} (${Math.round(f.size/1024)} KB)?\n\n`+
+              `It is written to the spare flash slot and runs after a restart. `+
+              `If it fails to come back, the board reverts to the firmware it is running now.`)) return;
+  const b=$('fwup-go'), st=$('fwup-stat');
+  b.disabled=true; st.textContent='Uploading… do not close this page.';
+  try{
+    const res=await fetch(forUps('/api/ota/upload'),{method:'POST',
+      headers:Object.assign({'Content-Type':'application/octet-stream'},tok?{'X-Auth-Token':tok}:{}),
+      body:f});
+    const r=await readReply(res);
+    if(r.ok){ st.textContent='Installed. Press Restart to run it.'; toast('Firmware installed'); otaBuilt=null; poll(); }
+    else    { st.textContent=r.error||'failed'; toast(r.error||'failed'); }
+  }catch(e){ st.textContent='the upload did not complete'; toast('Upload failed'); }
+  b.disabled=false;
+};
 // The Login card: change the login, or log out. It cannot be turned off.
 let authBuilt=null;
 function authUI(a,setup){
   const on=!!a.enabled;
   $('setup-login').hidden = !setup || on;
-  $('auth-card').hidden = setup || !on;
+  // Shown whenever a login exists, in setup or not. A board that never joins a
+  // network stays in "setup" for its whole life, and changing the default
+  // password must not be hidden behind joining one.
+  $('auth-card').hidden = !on;
+  const dflt=$('pw-default'); if(dflt) dflt.hidden = !a.default;
   // No login yet, and not in setup: only the create-login screen.
   const need = !setup && !on;
   document.body.classList.toggle('mkauth', need);
