@@ -2214,9 +2214,8 @@ function busUI(b){
 // already behind the login; the firmware card's button only appears in some
 // update states, which is no use when you have just changed the baud rate.
 $('bus-reboot').onclick=async()=>{
-  if(!confirm('Restart the board now?
-
-The bus goes quiet for a few seconds. A BMS polling this device will log it as offline.')) return;
+  if(!confirm('Restart the board now?\n\nThe bus goes quiet for a few seconds. '
+             +'A BMS polling this device will log it as offline.')) return;
   const r=await api('/api/reboot');
   toast(r.ok?'Restarting…':(r.error||'failed'));
 };
