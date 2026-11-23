@@ -5,6 +5,7 @@
 #include "board.h"
 #include "mbcontroller.h"
 #include "driver/uart.h"
+#include "esp_netif.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -220,50 +221,12 @@ static void mb_task(void *arg)
     }
 }
 
-esp_err_t out_modbus_start(void)
+/* The register areas and the stack start. Identical for RTU and TCP -- the
+ * point set does not care what carries it -- so this is shared rather than
+ * written twice and left to drift. */
+static esp_err_t areas_and_start(void)
 {
-    out_proto_t proto = out_common_proto();
-    if (proto != OUT_PROTO_MODBUS_RTU && proto != OUT_PROTO_MODBUS_TCP) {
-        return ESP_OK;                      /* not ours: cost the board nothing */
-    }
-    if (proto == OUT_PROTO_MODBUS_TCP) {
-        /* Needs an interface with an address, and the settings page only
-         * offers it when there is one. Not wired yet. */
-        ESP_LOGW(TAG, "Modbus TCP is selected but not implemented yet");
-        return ESP_OK;
-    }
-#if !BOARD_HAS_RS485
-    ESP_LOGE(TAG, "Modbus RTU selected, but this board has no RS485 transceiver");
-    return ESP_ERR_NOT_SUPPORTED;
-#else
-    s_stat_lock = xSemaphoreCreateMutex();
-    if (!s_stat_lock) return ESP_ERR_NO_MEM;
-
-    int baud = out_common_baud();
-    if (baud == OUT_BAUD_AUTO) {
-        baud = BAUD_FALLBACK;
-        ESP_LOGW(TAG, "baud is set to auto but autobaud is not built yet: using %d", baud);
-    }
-    const int addr = out_common_address();
-    const out_fmt_t fmt = out_common_format();
-    const uart_parity_t par = (fmt == OUT_FMT_8E1) ? UART_PARITY_EVEN
-                            : (fmt == OUT_FMT_8O1) ? UART_PARITY_ODD
-                                                   : UART_PARITY_DISABLE;
-
-    esp_err_t err = mbc_slave_init(MB_PORT_SERIAL_SLAVE, &s_handler);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "slave init: %s", esp_err_to_name(err)); return err; }
-
-    mb_communication_info_t comm = {
-        .mode       = MB_MODE_RTU,
-        .slave_addr = (uint8_t)addr,
-        .port       = BOARD_RS485_UART,
-        .baudrate   = (uint32_t)baud,
-        .parity     = par,
-    };
-    if ((err = mbc_slave_setup(&comm)) != ESP_OK) {
-        ESP_LOGE(TAG, "slave setup: %s", esp_err_to_name(err));
-        return err;
-    }
+    esp_err_t err;
 
     refresh();
 
@@ -311,6 +274,111 @@ esp_err_t out_modbus_start(void)
         ESP_LOGE(TAG, "slave start: %s", esp_err_to_name(err));
         return err;
     }
+    return ESP_OK;
+
+fail:
+    ESP_LOGE(TAG, "register area: %s", esp_err_to_name(err));
+    return err;
+}
+
+/* Modbus TCP. The stack's TCP slave is already compiled in
+ * (CONFIG_FMB_COMM_MODE_TCP_EN defaults on), so this costs no new dependency.
+ *
+ * Bound to the STATION interface on purpose. The setup access point is open
+ * and unauthenticated, and a listener on every interface would serve the
+ * point set there too; a BMS reaches this board over the network it joined,
+ * which is the only place this data belongs. */
+static esp_err_t start_tcp(int addr)
+{
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!netif) {
+        ESP_LOGE(TAG, "Modbus TCP needs the Wi-Fi station interface, which is not up");
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t err = mbc_slave_init(MB_PORT_TCP_SLAVE, &s_handler);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "slave init (TCP): %s", esp_err_to_name(err));
+        return err;
+    }
+    /* mb_communication_info_t is a UNION: these are the TCP arm's fields, and
+     * the serial arm's must be left alone. ip_addr NULL accepts any client --
+     * the brief's allowed-client list is a later setting, and until it exists
+     * the honest position is that anything on that LAN can read this. */
+    mb_communication_info_t comm = {
+        .ip_mode      = MB_MODE_TCP,
+        .slave_uid    = (uint8_t)addr,
+        .ip_port      = CONFIG_FMB_TCP_PORT_DEFAULT,
+        .ip_addr_type = MB_IPV4,
+        .ip_addr      = NULL,
+        .ip_netif_ptr = netif,
+    };
+    if ((err = mbc_slave_setup(&comm)) != ESP_OK) {
+        ESP_LOGE(TAG, "slave setup (TCP): %s", esp_err_to_name(err));
+        return err;
+    }
+    if ((err = areas_and_start()) != ESP_OK) return err;
+
+    xSemaphoreTake(s_stat_lock, portMAX_DELAY);
+    s_stat.running = true;
+    s_stat.address = addr;
+    s_stat.baud    = 0;                 /* a socket has no baud rate */
+    s_stat.format  = "TCP";
+    xSemaphoreGive(s_stat_lock);
+
+    if (xTaskCreate(mb_task, "out_mb", 3072, NULL, 4, NULL) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "Modbus TCP slave up: unit %d on port %d, up to %d masters",
+             addr, CONFIG_FMB_TCP_PORT_DEFAULT, CONFIG_FMB_TCP_PORT_MAX_CONN);
+    ESP_LOGI(TAG, "bus commands %s (coil %d starts a quick self-test)",
+             out_common_cmd_enabled() ? "ENABLED" : "off", CMD_COIL_ADDR);
+    return ESP_OK;
+}
+
+esp_err_t out_modbus_start(void)
+{
+    const out_proto_t proto = out_common_proto();
+    if (proto != OUT_PROTO_MODBUS_RTU && proto != OUT_PROTO_MODBUS_TCP) {
+        return ESP_OK;                      /* not ours: cost the board nothing */
+    }
+
+    s_stat_lock = xSemaphoreCreateMutex();
+    if (!s_stat_lock) return ESP_ERR_NO_MEM;
+
+    const int addr = out_common_address();
+
+    if (proto == OUT_PROTO_MODBUS_TCP) return start_tcp(addr);
+
+#if !BOARD_HAS_RS485
+    ESP_LOGE(TAG, "Modbus RTU selected, but this board has no RS485 transceiver");
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    int baud = out_common_baud();
+    if (baud == OUT_BAUD_AUTO) {
+        baud = BAUD_FALLBACK;
+        ESP_LOGW(TAG, "baud is set to auto but autobaud is not built yet: using %d", baud);
+    }
+    const out_fmt_t fmt = out_common_format();
+    const uart_parity_t par = (fmt == OUT_FMT_8E1) ? UART_PARITY_EVEN
+                            : (fmt == OUT_FMT_8O1) ? UART_PARITY_ODD
+                                                   : UART_PARITY_DISABLE;
+
+    esp_err_t err = mbc_slave_init(MB_PORT_SERIAL_SLAVE, &s_handler);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "slave init: %s", esp_err_to_name(err)); return err; }
+
+    mb_communication_info_t comm = {
+        .mode       = MB_MODE_RTU,
+        .slave_addr = (uint8_t)addr,
+        .port       = BOARD_RS485_UART,
+        .baudrate   = (uint32_t)baud,
+        .parity     = par,
+    };
+    if ((err = mbc_slave_setup(&comm)) != ESP_OK) {
+        ESP_LOGE(TAG, "slave setup: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    if ((err = areas_and_start()) != ESP_OK) return err;
 
     /* After the stack has the UART. The driver-enable is the peripheral's own
      * RTS in half-duplex mode -- see board.h; keying it in software is a race
@@ -352,10 +420,6 @@ esp_err_t out_modbus_start(void)
     ESP_LOGI(TAG, "bus commands %s (coil %d starts a quick self-test)",
              out_common_cmd_enabled() ? "ENABLED" : "off", CMD_COIL_ADDR);
     return ESP_OK;
-
-fail:
-    ESP_LOGE(TAG, "register area: %s", esp_err_to_name(err));
-    return err;
 #endif /* BOARD_HAS_RS485 */
 }
 

@@ -1329,15 +1329,18 @@ static esp_err_t post_bus(httpd_req_t *req)
         why = "could not save the command setting";
     } else if (cJSON_IsNumber(jp)) {
         int p = jp->valueint;
-        if (p == OUT_PROTO_BACNET_MSTP || p == OUT_PROTO_MODBUS_TCP ||
-            p == OUT_PROTO_BACNET_IP) {
-            /* In the enum, served by nothing: out_bacnet does not exist and
-             * out_modbus logs "not implemented yet" for TCP. Accepting one
-             * would leave the board silent while the page named a protocol,
-             * so it is refused here as well as hidden on the page. */
-            why = "only Modbus RTU is served by this firmware so far";
+        if (p == OUT_PROTO_BACNET_MSTP || p == OUT_PROTO_BACNET_IP) {
+            /* In the enum, served by nothing: there is no BACnet stack in
+             * this firmware yet. Accepting one would leave the board silent
+             * while the page named a protocol and the summary line claimed
+             * an address, so it is refused here as well as greyed out on
+             * the page. Both rows go live when out_bacnet does. */
+            why = "BACnet is not in this firmware yet";
         } else if (p == OUT_PROTO_MODBUS_RTU && !BOARD_HAS_RS485) {
             why = "this board has no RS485 transceiver";
+        } else if (p == OUT_PROTO_MODBUS_TCP &&
+                   netmgr_state() != NETMGR_STA_CONNECTED) {
+            why = "Modbus TCP needs the board to have joined a network";
         } else if ((e = out_common_set_proto((out_proto_t)p)) != ESP_OK) {
             why = "not a protocol this firmware knows";
         }
@@ -1369,6 +1372,17 @@ static esp_err_t post_radio(httpd_req_t *req)
     if (e == ESP_ERR_NOT_SUPPORTED) return send_err(req, "this board has no setup access point");
     if (e == ESP_ERR_INVALID_ARG)   return send_err(req, "always must be true or false");
     if (e != ESP_OK)                return send_err(req, "could not save the setting");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+/* Approves a trial image now. See ota_confirm_now(): the automatic gate waits
+ * five minutes to infer that the board works, and this is a person who can
+ * see that it does. Behind may_write(), so it is the owner's call. */
+static esp_err_t post_ota_confirm(httpd_req_t *req)
+{
+    if (!may_write(req)) return ESP_OK;
+    if (!ota_confirm_now()) return send_err(req, "could not confirm the running image");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
@@ -1985,11 +1999,12 @@ static esp_err_t route(httpd_req_t *req)
 #else
 #define ROUTES_TLS 0
 #endif
-/* 34, not 30: /api/ota/upload, /api/bus, /api/points and /api/radio are ours
- * (local firmware upload for a board with no route to GitHub, the BMS bus
- * settings, the register overview, and the setup-AP override). The static
- * assert below is what caught the omission, twice. */
-#define ROUTE_COUNT (34 + ROUTES_TAILSCALE + ROUTES_OUTAGELOG + ROUTES_HISTORY + ROUTES_TLS)
+/* 35, not 30: /api/ota/upload, /api/bus, /api/points, /api/radio and
+ * /api/ota/confirm are ours (local firmware upload for a board with no route
+ * to GitHub, the BMS bus settings, the register overview, the setup-AP
+ * override, and approving a trial image by hand). The static assert below is
+ * what caught the omission, twice. */
+#define ROUTE_COUNT (35 + ROUTES_TAILSCALE + ROUTES_OUTAGELOG + ROUTES_HISTORY + ROUTES_TLS)
 
 /* Order matters: the server tries these in turn and the wildcard route
  * matches everything, so it has to be last or it swallows the API. */
@@ -2009,6 +2024,7 @@ static const struct { const char *uri; httpd_method_t method; handler_fn fn; } R
     { "/api/ota/upload",       HTTP_POST, post_ota_upload },
     { "/api/bus",              HTTP_POST, post_bus },
     { "/api/radio",            HTTP_POST, post_radio },
+    { "/api/ota/confirm",      HTTP_POST, post_ota_confirm },
     { "/api/points",           HTTP_GET,  get_points },
     { "/api/ota/auto",         HTTP_POST, post_ota_auto },
     { "/api/fleet",            HTTP_POST, post_fleet },

@@ -182,6 +182,20 @@ void      ota_tls_give(void);
  * that. Associating proves the radio works, nothing more. */
 bool      ota_confirm(void);
 
+/* Confirms a trial image NOW, on a person's word, and cancels the rollback.
+ *
+ * ota_confirm() above earns it with five minutes of uptime and three served
+ * requests, which is a proxy for "a human would be able to tell this works".
+ * When there IS a human, looking at a working page and pressing a button,
+ * the proxy is redundant: the request that carries this one has already
+ * proved the web server registers its handlers and answers, which is exactly
+ * what the two bugs this gate was built for would have failed.
+ *
+ * Returns true once the image is confirmed, or was never on trial. It does
+ * not wait and it does not second-guess the caller -- the judgement is the
+ * person's, and the only thing it refuses is nothing at all. */
+bool      ota_confirm_now(void);
+
 /* Evidence that the web server is not merely listening but answering. Called
  * by the HTTP layer on each completed request. */
 void      ota_note_request_served(void);

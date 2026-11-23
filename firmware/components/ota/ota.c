@@ -1102,3 +1102,20 @@ bool ota_confirm(void)
     }
     return false;      /* esp_ota_mark_app_valid failed; try again next tick */
 }
+
+bool ota_confirm_now(void)
+{
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool pending = s_st.pending_verify;
+    xSemaphoreGive(s_lock);
+    if (!pending) return true;      /* nothing on trial: nothing to confirm */
+
+    if (esp_ota_mark_app_valid_cancel_rollback() != ESP_OK) return false;
+
+    ESP_LOGW(TAG, "image confirmed by hand after %lus; rollback cancelled",
+             (unsigned long)(esp_timer_get_time() / 1000000));
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_st.pending_verify = false;
+    xSemaphoreGive(s_lock);
+    return true;
+}
