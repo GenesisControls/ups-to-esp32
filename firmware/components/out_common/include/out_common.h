@@ -200,15 +200,16 @@ esp_err_t out_common_set_battery_life_years(int years);
 esp_err_t out_common_set_hb_policy(out_hb_policy_t p);
 out_hb_policy_t out_common_hb_policy(void);
 
-/* COMMANDS FROM THE BUS. Off by default, and deliberately so.
+/* COMMANDS FROM THE BUS. On by default.
  *
  * The brief's original rule was "read-only, no UPS commands over
  * Modbus/BACnet", reversed by Tobias on 2026-11-22 to allow a battery
- * self-test trigger. The rule existed for a reason that has not gone away:
- * an RS485 trunk is unauthenticated, a self-test puts the site's load on
- * battery, and a misconfigured master repeating the write would cycle the
- * pack. So this is per-board opt-in rather than a build-wide default, and a
- * board nobody enabled stays read-only exactly as before.
+ * self-test trigger, and made the default the same day. What the rule
+ * guarded against has not gone away -- an RS485 trunk is unauthenticated, a
+ * self-test puts the site's load on battery, and a misconfigured master
+ * repeating the write would cycle the pack -- so the guards below now carry
+ * the weight the default used to. A site that wants the old behaviour clears
+ * the checkbox on the board's own page.
  *
  * The command itself carries its own guards in out_modbus: quick test only,
  * refused unless the UPS's own descriptor reports UPS_CAP_TEST, rate

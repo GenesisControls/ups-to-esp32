@@ -54,7 +54,7 @@ static out_proto_t       s_proto = OUT_PROTO_NONE;
 static int               s_addr = OUT_ADDR_DEFAULT;
 static int               s_baud = OUT_BAUD_AUTO;
 static out_fmt_t         s_fmt = OUT_FMT_8N1;
-static bool              s_cmd_enabled;   /* bus commands: off unless asked */
+static bool              s_cmd_enabled = true;   /* self-test from the bus */
 
 /* ---- helpers ---------------------------------------------------------- */
 

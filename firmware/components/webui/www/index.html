@@ -486,6 +486,17 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
       </div>
       <button class="btn pri" id="save">Save</button>
       </div>
+      <div id="radio-box">
+        <div class="k" style="margin-top:14px">Setup access point</div>
+        <p class="note">It switches off after ten idle minutes; BOOT or a power cycle brings it
+          back for another ten. Held on, it stays up until someone clears this &mdash; useful on a
+          bench, and for the rare site that wants this page always reachable. It is an open,
+          unauthenticated access point, so leaving one up in a customer&rsquo;s building is a real
+          decision rather than a convenience. Applies at once, no restart, and a board that has
+          joined a network is unaffected either way.</p>
+        <label class="chk"><input type="checkbox" id="ap-always"> hold it on until I turn this off</label>
+        <p class="note" id="ap-stat"></p>
+      </div>
     </details>
 
     <details class="card" id="addr-card" hidden>
@@ -627,6 +638,8 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
         the bus: this device never accepts commands from it. Changes need a restart.</p>
       <label for="bus-proto">Protocol</label>
       <select id="bus-proto"></select>
+      <p class="note">Modbus RTU is the only protocol this firmware serves. BACnet MS/TP, Modbus
+        TCP and BACnet/IP are planned and cannot be chosen yet.</p>
       <label for="bus-addr">Address <span class="note">(Modbus unit ID, or BACnet MS/TP MAC &mdash; 1 to 127)</span></label>
       <input id="bus-addr" inputmode="numeric" autocomplete="off">
       <label for="bus-fmt">Data format</label>
@@ -647,9 +660,7 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
         <option value="115200">115200</option>
       </select>
       <label class="chk"><input type="checkbox" id="bus-cmd"> allow a battery self-test to be started from the bus</label>
-      <p class="note">Off by default, and worth leaving off unless you need it. An RS485 trunk is
-        unauthenticated, and a self-test puts this site&rsquo;s load on battery while it runs.
-        With it on, writing <b>coil 100</b> starts one quick test &mdash; refused unless the UPS
+      <p class="note">Writing <b>coil 100</b> starts one quick test &mdash; refused unless the UPS
         reports it can self-test, and at most one every 30 minutes. Everything else on the bus
         stays read-only.</p>
       <button class="btn" id="bus-save">Save</button>
@@ -1811,6 +1822,11 @@ async function poll(){
     // and the page then comes up normally on the board's own access point.
     const setup=w.state===PROVISIONING && s.setup_screen!==false, card=$('wifi-card');
     card.hidden=!!w.wired;      // a board on a cable has no Wi-Fi to show
+    // The setup-AP override. Written only when the board's answer changes, so
+    // the poll cannot move the checkbox out from under someone mid-click.
+    $('radio-box').hidden=setup||!!w.wired;
+    if(apShown!==w.ap_always){ apShown=w.ap_always; $('ap-always').checked=!!w.ap_always;
+      $('ap-stat').textContent=w.ap_always?'Held on. The idle window is overridden.':''; }
     authUI(s.auth||{}, setup);
     busUI(s.bus||{});
     if(document.body.classList.contains('setup')!==setup){
@@ -2154,18 +2170,18 @@ if($('fwup-go')) $('fwup-go').onclick=async()=>{
   }catch(e){ st.textContent='the upload did not complete'; toast('Upload failed'); }
   b.disabled=false;
 };
-// The BMS bus card. The IP protocols are offered only when the board has
-// actually joined a network -- asking the network, not the board type, is
-// what lets an RS485 board serve Modbus TCP over Wi-Fi at the one site that
-// wants it.
+// The BMS bus card. Only a protocol this firmware actually serves is offered,
+// which today is Modbus RTU alone: out_bacnet does not exist and out_modbus
+// logs "not implemented yet" for TCP, so offering the other three would let
+// someone pick one and get silence on the trunk while this page named a
+// protocol. They come back here as each one starts working.
 let busBuilt=null;
 function busUI(b){
   const key=JSON.stringify([b.rs485,b.ip,b.proto,b.address,b.baud,b.format,b.cmd]);
   if(busBuilt!==key){
     busBuilt=key;
     const opts=[[1,'none (nothing on the bus)']];
-    if(b.rs485){ opts.push([2,'Modbus RTU (RS485)']); opts.push([3,'BACnet MS/TP (RS485)']); }
-    if(b.ip){ opts.push([4,'Modbus TCP']); opts.push([5,'BACnet/IP']); }
+    if(b.rs485) opts.push([2,'Modbus RTU (RS485)']);
     $('bus-proto').innerHTML=opts.map(o=>`<option value="${o[0]}">${esc(o[1])}</option>`).join('');
     $('bus-proto').value=String(b.proto||1);
     $('bus-addr').value=b.address||4;
@@ -2185,7 +2201,7 @@ function busUI(b){
   else if(b.quiet_s<0) st=`Running at ${b.baud||'auto'} baud. Nothing has polled this device yet.`;
   else st=`Running at ${b.baud} baud ${fmts[b.format||1]} · ${b.requests} request${b.requests===1?'':'s'} · last ${b.quiet_s}s ago`
          + (b.writes?` · ${b.writes} write${b.writes===1?'':'s'} refused`:'');
-  if(!b.ip) st+=' The IP protocols appear once this board has joined a network.';
+
 
   // Communication, for commissioning. Everything here is measured; see
   // out_modbus.h for why there is no CRC/framing error count -- esp-modbus
@@ -2227,6 +2243,18 @@ $('bus-save').onclick=async()=>{
                                 cmd:$('bus-cmd').checked});
   if(!r.ok){ toast(r.error||'failed'); return; }
   busBuilt=null; toast('Saved — restart to apply'); poll();
+};
+// Applies on the spot, unlike everything else in this card -- netmgr acts the
+// moment it is set, so a Save button would be a lie about when it took effect.
+let apShown=null;
+$('ap-always').onchange=async()=>{
+  const on=$('ap-always').checked;
+  if(on && !confirm('Leave this board broadcasting an open access point until someone turns it off?')){
+    $('ap-always').checked=false; return;
+  }
+  const r=await api('/api/radio',{always:on});
+  if(!r.ok){ $('ap-always').checked=!on; toast(r.error||'failed'); return; }
+  apShown=null; toast(on?'Access point held on':'Idle window back on'); poll();
 };
 
 // The register overview. Fetched only while its card is open -- thirty-five
