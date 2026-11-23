@@ -723,10 +723,20 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
       <div id="f-cmd">
         <label class="chk"><input type="checkbox" id="bus-cmd"> allow a battery self-test to be started from the bus</label>
         <p class="note">Writing <b>Modbus coil 100</b>, or <b>BACnet BV1</b> (&ldquo;Start battery
-          self-test&rdquo;), starts one quick test &mdash; refused unless the UPS reports it can
-          self-test, and at most one every 30 minutes however many protocols ask. Everything else
-          on the bus stays read-only. With this unticked, BV1 is still visible to a BMS but reports
-          itself as not writable, and a write to either address is refused.</p>
+          self-test&rdquo;), starts one quick test &mdash; a few seconds on battery. Refused unless
+          the UPS reports it can self-test, and at most one every 30 minutes however many protocols
+          ask. With this unticked, BV1 is still visible to a BMS but reports itself as not
+          writable, and a write to either address is refused.</p>
+
+        <label class="chk"><input type="checkbox" id="bus-deep"> allow a <b>deep</b> battery test to be started from the bus</label>
+        <p class="note"><b>This one is not the same request.</b> A deep test is a runtime
+          calibration: it runs the battery down to its low-battery level, which on a lightly loaded
+          UPS is well over an hour, and the site is unprotected if the mains fails while it runs.
+          Its own permission for that reason, off by default, and at most one a day.
+          <b>Modbus coil 101</b> or <b>BACnet BV2</b>.</p>
+        <p class="note"><b>Modbus coil 102</b> and <b>BACnet BV3</b> stop a running test. Available
+          whenever either box above is ticked, and never rate limited &mdash; a site that needs its
+          battery back must not be told to wait. Everything else on the bus stays read-only.</p>
       </div>
       <button class="btn" id="bus-save">Save</button>
       <button class="btn" id="bus-reboot">Restart board</button>
@@ -2283,7 +2293,7 @@ let busBuilt=null;
 // and quietly take the trunk off the bus.
 let busLoaded=false;
 function busUI(b){
-  const key=JSON.stringify([b.has485,b.ip,b.proto,b.tcp_en,b.address,b.baud,b.format,b.cmd,
+  const key=JSON.stringify([b.has485,b.ip,b.proto,b.tcp_en,b.address,b.baud,b.format,b.cmd,b.deep,
                             b.devid_set,b.infofr,b.maxmast,b.mbport,b.tcpuid]);
   if(busBuilt!==key){
     // A board with no transceiver cannot offer the two RS485 protocols. The
@@ -2300,6 +2310,7 @@ function busUI(b){
     $('bus-baud').value=String(b.baud===undefined?0:b.baud);
     $('bus-fmt').value=String(b.format||1);
     $('bus-cmd').checked=!!b.cmd;
+    $('bus-deep').checked=!!b.deep;
     $('bus-devid').value=String(b.devid_set===undefined?0:b.devid_set);
     $('bus-infofr').value=String(b.infofr||1);
     $('bus-maxmast').value=String(b.maxmast===undefined?127:b.maxmast);
@@ -2441,7 +2452,8 @@ $('bus-save').onclick=async()=>{
   // describe one transport each.
   const body={proto:+$('bus-proto').value,
               tcp_en:$('bus-tcp-en').checked,
-              cmd:$('bus-cmd').checked};
+              cmd:$('bus-cmd').checked,
+              deep:$('bus-deep').checked};
   const maybe={address:val('bus-addr','f-addr'),
                baud:   val('bus-baud','f-baud'),
                format: val('bus-fmt','f-fmt'),

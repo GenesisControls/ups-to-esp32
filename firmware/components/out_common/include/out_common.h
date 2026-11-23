@@ -68,7 +68,20 @@ enum {                          /* input registers (FC4), mirrored as holding */
     OUT_R_TEST_RESULT,
     OUT_R_TRANSFER_LOW_V10,
     OUT_R_TRANSFER_HIGH_V10,
-    /* 12-15 reserved for further UPS facts */
+    /* 12: the UPS's own alarm. 1 disabled, 2 enabled, 3 muted -- the
+     * AudibleAlarmControl values, already 1-based, so the number is the same
+     * on both protocols with no renumbering.
+     *
+     * "Enabled" means the beeper is ALLOWED to sound, not that it is sounding.
+     * No UPS here reports "beeping right now": the status word is
+     * OL/OB/LB/CHRG/DISCHRG/RB/OVER and carries no alarm bit. What makes it
+     * sound is already on the bus as discretes 1-4.
+     *
+     * CLAIMED FROM THE RESERVED 12-15 RANGE on 2026-11-23. That range belongs
+     * to the shared map and the brief says not to take one without going
+     * through the other track -- this needs relaying, not assuming. */
+    OUT_R_BEEPER,
+    /* 13-15 reserved for further UPS facts */
     OUT_R_FW_VERSION = 16,
     OUT_R_RESET_COUNT,
     OUT_R_RESET_REASON,
@@ -328,11 +341,34 @@ out_hb_policy_t out_common_hb_policy(void);
 bool      out_common_cmd_enabled(void);
 esp_err_t out_common_set_cmd_enabled(bool on);
 
-/* Starts one quick battery self-test, if everything that can refuse it
- * agrees: this board has been opted in, a UPS is attached, its own report
- * descriptor says it can self-test, and the last one was over half an hour
- * ago. The outcome is logged either way, with `via` naming what asked, so a
- * technician reading the console learns which bus started a test.
+/* WHICH TEST. The UPS takes all three; until 2026-11-23 only the first
+ * reached the bus.
+ *
+ * STOP is not the opposite of a start, it is the safe one: it ends a
+ * condition rather than creating one. So it is allowed whenever either test
+ * is, and it is never rate limited -- a site that needs its battery back out
+ * of a two-hour calibration must not be told to wait twenty minutes. */
+typedef enum {
+    OUT_TEST_QUICK = 0,     /* seconds on battery                            */
+    OUT_TEST_DEEP,          /* runtime calibration: down to low battery      */
+    OUT_TEST_STOP,          /* abort whatever is running                     */
+} out_test_t;
+
+/* DEEP HAS ITS OWN OPT-IN, separate from the quick test's.
+ *
+ * A quick test is seconds on battery. A deep test is a runtime calibration:
+ * it runs the pack down to the low-battery threshold, which on a lightly
+ * loaded unit is well over an hour with the site unprotected if the mains
+ * fails meanwhile. One checkbox authorising both would have been the wrong
+ * shape for a trunk nobody authenticates. Off by default. */
+bool      out_common_deep_enabled(void);
+esp_err_t out_common_set_deep_enabled(bool on);
+
+/* Starts or stops a battery test, if everything that can refuse it agrees:
+ * this board has been opted in FOR THAT TEST, a UPS is attached, its own
+ * report descriptor says it can self-test, and the rate limit has run. The
+ * outcome is logged either way, with `via` naming what asked, so a technician
+ * reading the console learns which bus started a test.
  *
  * SHARED ON PURPOSE. Modbus TCP can run alongside BACnet MS/TP, so two
  * transports can reach the same battery. The half-hour limit is a statement
@@ -342,6 +378,6 @@ esp_err_t out_common_set_cmd_enabled(bool on);
  *
  * ESP_OK means the command reached the UPS. Callers count that and nothing
  * else; every refusal is already logged here. */
-esp_err_t out_common_request_selftest(const char *via);
+esp_err_t out_common_request_test(out_test_t which, const char *via);
 
 #endif /* GENESIS_OUT_COMMON_H */

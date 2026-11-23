@@ -29,6 +29,7 @@ static const char *TAG = "outcom";
 #define KEY_BAUD        "oc_baud"
 #define KEY_FMT         "oc_fmt"
 #define KEY_CMD         "oc_cmd"
+#define KEY_DEEP        "oc_deep"
 #define KEY_DEVID       "oc_devid"
 #define KEY_INFOFR      "oc_infofr"
 #define KEY_MAXMAST     "oc_maxmast"
@@ -62,6 +63,9 @@ static int               s_addr = OUT_ADDR_DEFAULT;
 static int               s_baud = OUT_BAUD_AUTO;
 static out_fmt_t         s_fmt = OUT_FMT_8N1;
 static bool              s_cmd_enabled = true;   /* self-test from the bus */
+/* Off by default, unlike the quick test: see out_common.h for why a runtime
+ * calibration is not the same kind of request. */
+static bool              s_deep_enabled;
 static uint32_t          s_devid = OUT_DEVID_DERIVE;
 static int               s_info_frames = OUT_INFOFRAMES_DEFAULT;
 static int               s_max_master = OUT_MAXMASTER_DEFAULT;
@@ -248,6 +252,12 @@ static void build(out_points_t *p)
     p->reg[OUT_R_BATTERY_AGE_D] = ok ? battery_age_days(d.battery_mfr_date) : OUT_ABSENT;
     p->reg[OUT_R_TEST_RESULT]   = test_result(ok && (d.caps & UPS_CAP_TEST), d.test_result);
 
+    /* Register 12. AudibleAlarmControl reads back 1/2/3; 0 means the UPS has
+     * no such usage, which is "not reported" rather than a fourth state. */
+    p->reg[OUT_R_BEEPER] = (ok && (d.caps & UPS_CAP_BEEPER) &&
+                            d.beeper >= 1 && d.beeper <= 3)
+                               ? (uint16_t)d.beeper : OUT_ABSENT;
+
     /* The AVR window: static for a unit, and what makes discretes 6 and 7
      * readable -- boost and trim say the mains left the window, these say
      * where it is. NUT variables rather than ups_data_t fields. */
@@ -273,7 +283,7 @@ static void build(out_points_t *p)
 
     /* Which addresses exist at all. Everything not set here is absent from
      * the datastore and answers Modbus exception 02, NOT 65535. */
-    for (int i = 0; i <= OUT_R_TRANSFER_HIGH_V10; i++) p->reg_live[i] = true;
+    for (int i = 0; i <= OUT_R_BEEPER; i++) p->reg_live[i] = true;
     p->reg_live[OUT_R_FW_VERSION]   = true;
     p->reg_live[OUT_R_RESET_COUNT]  = true;
     p->reg_live[OUT_R_RESET_REASON] = true;
@@ -355,6 +365,8 @@ static void load_settings(void)
     if (nvs_get_i32(h, KEY_BAUD, &bd) == ESP_OK && bd >= 0) s_baud = bd;
     uint8_t cm = 0;
     if (nvs_get_u8(h, KEY_CMD, &cm) == ESP_OK) s_cmd_enabled = cm != 0;
+    uint8_t dp = 0;
+    if (nvs_get_u8(h, KEY_DEEP, &dp) == ESP_OK) s_deep_enabled = dp != 0;
     uint8_t fm = 0;
     if (nvs_get_u8(h, KEY_FMT, &fm) == ESP_OK &&
         fm >= OUT_FMT_8N1 && fm <= OUT_FMT_8N2) s_fmt = (out_fmt_t)fm;
@@ -682,46 +694,98 @@ esp_err_t out_common_set_tcp_enabled(bool on)
 
 bool out_common_cmd_enabled(void) { return s_cmd_enabled; }
 
+bool out_common_deep_enabled(void) { return s_deep_enabled; }
+
+esp_err_t out_common_set_deep_enabled(bool on)
+{
+    esp_err_t e = put_u8(KEY_DEEP, on ? 1 : 0);
+    if (e == ESP_OK) {
+        s_deep_enabled = on;
+        ESP_LOGW(TAG, "DEEP battery tests from the bus are now %s",
+                 on ? "ENABLED" : "off");
+    }
+    return e;
+}
+
 /* A stuck or misconfigured master must not be able to cycle the battery. A
  * quick test is seconds of load on battery; one every half hour is generous
- * for any real use and useless as a way to flatten a pack. */
+ * for any real use and useless as a way to flatten a pack.
+ *
+ * A deep test is a different animal and gets a different number. It runs the
+ * pack down to the low-battery threshold, so more than one a day is not
+ * maintenance, it is wear -- and on a site where the mains is poor it is wear
+ * with the load unprotected. */
 #define CMD_MIN_GAP_US  (30LL * 60 * 1000000)
-static int64_t s_cmd_last_us;
+#define DEEP_MIN_GAP_US (24LL * 60 * 60 * 1000000)
+static int64_t s_cmd_last_us;       /* any test start */
+static int64_t s_deep_last_us;      /* deep starts only */
 
-esp_err_t out_common_request_selftest(const char *via)
+esp_err_t out_common_request_test(out_test_t which, const char *via)
 {
+    const bool deep = (which == OUT_TEST_DEEP);
+    const bool stop = (which == OUT_TEST_STOP);
+    const char *what = deep ? "DEEP battery test (runtime calibration)"
+                     : stop ? "stop battery test"
+                            : "quick battery self-test";
+
     /* Reversing "read-only on the bus" was Tobias's call on 2026-11-22; the
      * reasons it was the rule are unchanged, so these guards are the
      * compensation: the board owner opts in, the UPS must say it can
      * self-test, and the rate limit means the worst a hostile or broken
      * master achieves is one quick test every half hour. */
-    if (!s_cmd_enabled) {
-        ESP_LOGW(TAG, "self-test requested via %s, but commands are off on this board", via);
+    /* Each test answers to its own switch; stop answers to either, because a
+     * board that accepts any command must be able to take it back. */
+    const bool allowed = deep ? s_deep_enabled
+                       : stop ? (s_cmd_enabled || s_deep_enabled)
+                              : s_cmd_enabled;
+    if (!allowed) {
+        ESP_LOGW(TAG, "%s requested via %s, but %s off on this board", what, via,
+                 deep ? "deep tests are" : "commands are");
         return ESP_ERR_NOT_ALLOWED;
     }
     ups_data_t d;
     ups_hid_get(&d);
     if (!d.attached) {
-        ESP_LOGW(TAG, "self-test requested via %s, but no UPS is attached", via);
+        ESP_LOGW(TAG, "%s requested via %s, but no UPS is attached", what, via);
         return ESP_ERR_NOT_FOUND;
     }
     if (!(d.caps & UPS_CAP_TEST)) {
-        /* From the UPS's own report descriptor, never from its model name. */
-        ESP_LOGW(TAG, "self-test requested via %s, but this UPS does not report that it can", via);
+        /* From the UPS's own report descriptor, never from its model name.
+         * One capability covers start and abort alike. */
+        ESP_LOGW(TAG, "%s requested via %s, but this UPS does not report that it can",
+                 what, via);
         return ESP_ERR_NOT_SUPPORTED;
     }
+
     const int64_t now = esp_timer_get_time();
-    if (s_cmd_last_us && (now - s_cmd_last_us) < CMD_MIN_GAP_US) {
-        ESP_LOGW(TAG, "self-test requested via %s %llds after the last one; ignored "
-                      "(minimum %lld min)", via,
-                 (long long)((now - s_cmd_last_us) / 1000000),
-                 (long long)(CMD_MIN_GAP_US / 60000000));
-        return ESP_ERR_INVALID_STATE;
+    if (!stop) {
+        if (s_cmd_last_us && (now - s_cmd_last_us) < CMD_MIN_GAP_US) {
+            ESP_LOGW(TAG, "%s requested via %s %llds after the last test; ignored "
+                          "(minimum %lld min between tests)", what, via,
+                     (long long)((now - s_cmd_last_us) / 1000000),
+                     (long long)(CMD_MIN_GAP_US / 60000000));
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (deep && s_deep_last_us && (now - s_deep_last_us) < DEEP_MIN_GAP_US) {
+            ESP_LOGW(TAG, "%s requested via %s %lldh after the last deep test; ignored "
+                          "(minimum %lld h)", what, via,
+                     (long long)((now - s_deep_last_us) / 3600000000LL),
+                     (long long)(DEEP_MIN_GAP_US / 3600000000LL));
+            return ESP_ERR_INVALID_STATE;
+        }
+        s_cmd_last_us = now;
+        if (deep) s_deep_last_us = now;
     }
-    s_cmd_last_us = now;
-    const esp_err_t e = ups_hid_command(UPS_CMD_TEST_QUICK, 0);
-    ESP_LOGW(TAG, "QUICK BATTERY SELF-TEST started via %s: %s. "
-                  "The load is on battery while it runs.", via, esp_err_to_name(e));
+
+    const esp_err_t e = ups_hid_command(
+        deep ? UPS_CMD_TEST_DEEP : stop ? UPS_CMD_TEST_ABORT : UPS_CMD_TEST_QUICK, 0);
+    if (stop) {
+        ESP_LOGW(TAG, "BATTERY TEST STOPPED via %s: %s", via, esp_err_to_name(e));
+    } else {
+        ESP_LOGW(TAG, "%s started via %s: %s. The load is on battery while it runs%s",
+                 what, via, esp_err_to_name(e),
+                 deep ? ", which for a calibration means until the battery is low." : ".");
+    }
     return ESP_OK;
 }
 
@@ -778,6 +842,7 @@ const char *out_common_reg_name(int i)
     case OUT_R_STATUS_BITS:      return "Status bitfield (bits 0-5)";
     case OUT_R_BATTERY_AGE_D:    return "Days since battery change";
     case OUT_R_TEST_RESULT:      return "Self-test result";
+    case OUT_R_BEEPER:           return "Beeper";
     case OUT_R_TRANSFER_LOW_V10: return "Input transfer low";
     case OUT_R_TRANSFER_HIGH_V10:return "Input transfer high";
     case OUT_R_FW_VERSION:       return "Firmware version";

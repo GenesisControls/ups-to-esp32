@@ -76,6 +76,7 @@ protected load from an unprotected one.
 | 9 | Self-test result | enum below | the UPS cannot self-test, or comm lost |
 | 10 | Input transfer low | V × 10 | the UPS does not report the window |
 | 11 | Input transfer high | V × 10 | the UPS does not report the window |
+| 12 | Beeper | enum below | this UPS has no controllable alarm, or comm lost |
 | | *— 16–23 describe the adapter —* | | |
 | 16 | Firmware version | major×100 + minor | never |
 | 17 | Restart counter | count | never |
@@ -147,7 +148,27 @@ the firmware crashed, **10 (Brownout)** means the supply sagged — the one to
 watch on a board powered from the UPS's own USB port — and **2 (Power-on)**
 after an unattended period means the board lost power.
 
-### Reserved addresses — 12–15 and 19–23
+#### Register 12 — beeper
+
+| Value | Meaning |
+|---|---|
+| 1 | Disabled — it will not sound |
+| 2 | Enabled — it is allowed to sound |
+| 3 | Muted — the alarm sounding now is silenced; future ones are not |
+| 65535 | this UPS has no controllable alarm, or comm lost |
+
+The AudibleAlarmControl values unchanged, so again nothing is renumbered.
+
+**This does not say whether it is beeping right now.** *Enabled* is permission,
+not noise. Nothing in the UPS's status word reports an alarm sounding — it
+carries `OL OB LB CHRG DISCHRG RB OVER` and no alarm bit — so there is nothing
+to publish. What makes it sound is already on the bus: discretes 1–4.
+
+> **Claimed from the reserved 12–15 range on 2026-11-23.** That range belongs
+> to the shared map, so this needs relaying to `ups-modbus-monitoring` rather
+> than assuming. 13–15 remain reserved.
+
+### Reserved addresses — 13–15 and 19–23
 
 These are **not** 65535. They are not registered in the datastore at all, so
 reading one returns **Modbus exception 02 (illegal data address)**.
@@ -157,7 +178,7 @@ that point and cannot read it right now*, exception 02 means *that point does
 not exist on this device*. A commissioning engineer who sees 02 has a typo or
 a point sheet from the wrong version; one who sees 65535 has a UPS question.
 
-Registers 12–15 and 19–23 are reserved for future UPS and adapter facts
+Registers 13–15 and 19–23 are reserved for future UPS and adapter facts
 respectively. Don't claim one without going through the other track.
 
 ### Comm-loss behaviour, exactly
@@ -180,16 +201,29 @@ Real measurements are clamped to **65534**, so 65535 is never a real reading.
 Every address above is read-only and the stack refuses a write with an
 exception — not silently ignored, not accepted-then-reverted.
 
-**Coil 100 is the one exception**: writing it starts one quick battery
-self-test. **It is enabled by default**, and refused unless the UPS's own
-descriptor says it can self-test, at most one per 30 minutes. Everything else
-stays read-only.
+**Three coils are the exception**, and nothing else on the device is writable:
 
-The rate limit is **per board, not per protocol**: Modbus coil 100 and BACnet
-BV1 reach the same battery, and a board serving MS/TP on the trunk and Modbus
-TCP over Wi-Fi still gets one test per half hour in total. Untick *allow a
-battery self-test to be started from the bus* on the board's own page to refuse
-both.
+| Coil | Starts | Permission | Rate limit |
+|---|---|---|---|
+| 100 | quick self-test — seconds on battery | **on by default** | one per 30 min |
+| 101 | **deep test** — runtime calibration | **off by default**, its own tick-box | one per day, and the 30 min above |
+| 102 | stop a running test | either box | **none** |
+
+All three are refused unless the UPS's own descriptor says it can self-test.
+
+**Coil 101 is not coil 100 with a longer runtime.** A deep test runs the
+battery down to its low-battery level — on a lightly loaded UPS that is well
+over an hour — and the site is unprotected if the mains fails while it runs.
+It has a separate permission for that reason, and is off until somebody ticks
+it.
+
+**Coil 102 is never rate limited.** Stopping ends a condition rather than
+creating one, and a site that needs its battery back out of a calibration must
+not be told to wait twenty minutes.
+
+The rate limits are **per board, not per protocol**. Coil 100 and BACnet BV1
+reach the same battery, so a board serving MS/TP on the trunk and Modbus TCP
+over Wi-Fi still gets one quick test per half hour in total.
 
 ---
 
@@ -219,6 +253,7 @@ point — see the end of this section.
 | BI9 | Charging | | **MSI10** | Self-test result |
 | BI10 | Battery age alarm | | AI11 | Input transfer low (V) |
 | BI11 | Output not protecting | | AI12 | Input transfer high (V) |
+| | | | **MSI13** | Beeper |
 | | | | AI17 | Firmware version |
 | | | | AI18 | Restart counter |
 | | | | **MSI19** | Last restart reason |
@@ -227,7 +262,7 @@ point — see the end of this section.
 whose value is `0b101101` is a Modbus workaround, not data — every bit of it
 is already BI1–BI6.
 
-**MSI10 and MSI19 are Multi-State Inputs, not Analog Inputs**, because they
+**MSI10, MSI13 and MSI19 are Multi-State Inputs, not Analog Inputs**, because they
 are enumerations rather than measurements. Each state carries its text, so a
 BMS shows `Task watchdog` where an AI could only show `7.0`. Multi-State
 Input is a different object type from Analog Input, so the instance rule is
@@ -252,20 +287,22 @@ number a trend log would happily plot. **BI6 (Comm OK) is deliberately
 exempt** — the object that reports whether the link is up has to stay
 readable when it is down.
 
-### BV1 — the one writable object
+### BV1–BV3 — the only writable objects
 
-| Object | Point | Writable |
-|---|---|---|
-| BV1 | Start battery self-test | **yes**, when enabled on the board |
+| Object | Writes | Modbus twin | Permission |
+|---|---|---|---|
+| BV1 | Start battery self-test | coil 100 | on by default |
+| BV2 | Start deep battery test | coil 101 | **off by default** |
+| BV3 | Stop battery test | coil 102 | either of the above |
 
-Writing BV1 **Active** starts one quick battery self-test — the BACnet
-counterpart of Modbus coil 100, with the same guards and the *same* half-hour
-limit shared between them. Its present-value returns to Inactive immediately:
-it is a momentary trigger, not a state, so it never reads as "a test is
-running". Register 9 / AI10 is what reports the result.
+Writing one **Active** performs the action, with the same guards and the same
+rate limits as its Modbus twin — they are the same board and the same battery.
+Present-value returns to Inactive immediately: these are momentary triggers,
+not states, so none of them ever reads as "a test is running". **MSI10** is
+what reports the result.
 
-A BMS sees `Start test` and `Idle` rather than `Active` and `Inactive`, and the
-object's description says what a write does.
+A BMS sees `Start test`, `Start deep test` or `Stop` rather than `Active`, and
+each object's description says what a write does and what it costs.
 
 It is a Binary **Value**, not a Binary Output: a BO models a physical output
 this board does not have. It is also not commandable — no priority array, no
@@ -277,9 +314,15 @@ BMS can see and log. Modbus cannot manage that: coil 100 is always writable,
 and the refusal is a line in the board's own console that nobody on the trunk
 ever reads.
 
-Present-value is the **only** writable property on BV1. Object name,
+Present-value is the **only** writable property on these. Object name,
 description and out-of-service are refused as well, which is stricter than the
 BACnet stack's own default for a Binary Value.
+
+**Neither protocol can tell you which test is running.** The UPS reports a
+single *in progress* with no test type — the Test usage is written with one
+table and read back with another that has no type field. What you can see is
+`OL` and `DISCHRG` together, which is the UPS discharging while the mains is
+fine, and that only ever means a test.
 
 Every other object is read-only, and a WriteProperty to one earns
 `write-access-denied` rather than `service-not-supported`, so a BMS sees a

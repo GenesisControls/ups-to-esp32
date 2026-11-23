@@ -132,7 +132,8 @@ static const char *TAG = "out_bac";
  * for that reason, so a 4 on Modbus is state 4 here. */
 static bool reg_is_enum(int addr)
 {
-    return addr == OUT_R_TEST_RESULT || addr == OUT_R_RESET_REASON;
+    return addr == OUT_R_TEST_RESULT || addr == OUT_R_RESET_REASON ||
+           addr == OUT_R_BEEPER;
 }
 
 static bool reg_is_bacnet_point(int addr)
@@ -162,6 +163,8 @@ static BACNET_ENGINEERING_UNITS reg_units(int addr, float *divisor)
  * why Modbus put it at 100, far outside its data block. One BV on the device,
  * numbered 1, is what an engineer browsing it expects to find. */
 #define SELFTEST_BV     1
+#define DEEPTEST_BV     2
+#define STOPTEST_BV     3
 
 /* STATE TEXT, in the format basic/sys/state_name.c parses: NUL-separated C
  * strings with an empty one at the end. Index + 1 is the state number, which
@@ -202,6 +205,15 @@ static const char RESTART_STATES[] =
     "CPU lockup\0"         /* 16  ESP_RST_CPU_LOCKUP */
     "\0";
 
+/* AudibleAlarmControl's own values, so again no renumbering. "Enabled" is
+ * permission, not noise: it means the UPS may sound its alarm, not that it is
+ * sounding one. Nothing in the status word says whether it is. */
+static const char BEEPER_STATES[] =
+    "Disabled\0"           /* 1 */
+    "Enabled\0"            /* 2 */
+    "Muted\0"              /* 3 */
+    "\0";
+
 /* What each binary SAYS, instead of "Active" and "Inactive". Free -- bi.c
  * already carries both properties -- and it is the difference between an
  * operator reading a point and decoding one. These are literals in flash, so
@@ -226,7 +238,7 @@ static uint8_t                       s_pdu[MAX_MPDU + 16];
  * a USB HID command in there would push the ack past what a master waits
  * for. Same shape as out_modbus, where the coil is written by the stack and
  * read by the task loop. */
-static volatile bool                 s_bv_written;
+static volatile uint32_t             s_bv_hit;   /* bit N = BVn was written */
 static volatile struct mstp_port_struct_t s_mstp;
 static struct dlmstp_user_data_t     s_mstp_user;
 static uint8_t                       s_in[DLMSTP_MPDU_MAX];
@@ -339,24 +351,41 @@ static void bv_written(uint32_t instance, BACNET_BINARY_PV old_value,
                        BACNET_BINARY_PV value)
 {
     (void)old_value;
-    if (instance == SELFTEST_BV && value == BINARY_ACTIVE) s_bv_written = true;
+    if (value != BINARY_ACTIVE) return;
+    if (instance >= SELFTEST_BV && instance <= STOPTEST_BV) {
+        s_bv_hit |= 1u << instance;
+    }
 }
 
 /* Runs in bac_task, after the ack. Mirrors out_modbus's cmd_check(): clear
  * first so it is a trigger and not a state, then let out_common refuse it. */
 static void cmd_check(void)
 {
-    if (!s_bv_written) return;
-    s_bv_written = false;
-    /* Back to INACTIVE whatever happens next, including a refusal -- the
-     * object says "not running a test", not "a test was asked for". */
-    Binary_Value_Present_Value_Set(SELFTEST_BV, BINARY_INACTIVE);
+    const uint32_t hit = s_bv_hit;
+    if (!hit) return;
+    s_bv_hit = 0;
 
-    if (out_common_request_selftest("BACnet BV1") != ESP_OK) return;
+    static const struct {
+        uint32_t    inst;
+        out_test_t  which;
+        const char *via;
+    } BV_CMD[] = {
+        { SELFTEST_BV, OUT_TEST_QUICK, "BACnet BV1" },
+        { DEEPTEST_BV, OUT_TEST_DEEP,  "BACnet BV2" },
+        { STOPTEST_BV, OUT_TEST_STOP,  "BACnet BV3" },
+    };
 
-    xSemaphoreTake(s_stat_lock, portMAX_DELAY);
-    s_stat.tests_started++;
-    xSemaphoreGive(s_stat_lock);
+    for (unsigned k = 0; k < sizeof BV_CMD / sizeof BV_CMD[0]; k++) {
+        if (!(hit & (1u << BV_CMD[k].inst))) continue;
+        /* Back to INACTIVE whatever happens next, including a refusal -- the
+         * object says "not running a test", not "a test was asked for". */
+        Binary_Value_Present_Value_Set(BV_CMD[k].inst, BINARY_INACTIVE);
+        if (out_common_request_test(BV_CMD[k].which, BV_CMD[k].via) != ESP_OK) continue;
+        if (BV_CMD[k].which == OUT_TEST_STOP) continue;  /* a stop is not a test */
+        xSemaphoreTake(s_stat_lock, portMAX_DELAY);
+        s_stat.tests_started++;
+        xSemaphoreGive(s_stat_lock);
+    }
 }
 
 static void create_objects(void)
@@ -376,6 +405,7 @@ static void create_objects(void)
     static const struct { int reg; const char *states; } MSI[] = {
         { OUT_R_TEST_RESULT,  SELFTEST_STATES },
         { OUT_R_RESET_REASON, RESTART_STATES  },
+        { OUT_R_BEEPER,       BEEPER_STATES   },
     };
     for (unsigned k = 0; k < sizeof MSI / sizeof MSI[0]; k++) {
         const uint32_t inst = Multistate_Input_Create((uint32_t)MSI[k].reg + 1);
@@ -399,23 +429,50 @@ static void create_objects(void)
      * point that disappears tells a BMS nothing, while a point that is there
      * and not writable tells it exactly where it stands -- and it keeps one
      * point list valid across every board. */
-    const uint32_t bv = Binary_Value_Create(SELFTEST_BV);
-    Binary_Value_Name_Set(bv, "Start battery self-test");
-    Binary_Value_Description_Set(bv,
-        "Write Active to start one quick battery self-test. The load runs on "
-        "battery while it does. At most one every 30 minutes.");
-    /* Worth setting: a BMS shows these instead of "Active"/"Inactive", and
-     * "Start test" on a momentary point is the difference between an
-     * operator knowing what a write does and guessing. */
-    Binary_Value_Active_Text_Set(bv, "Start test");
-    Binary_Value_Inactive_Text_Set(bv, "Idle");
-    Binary_Value_Present_Value_Set(bv, BINARY_INACTIVE);
+    static const struct {
+        uint32_t    inst;
+        const char *name;
+        const char *desc;
+        const char *on;
+    } BV[] = {
+        { SELFTEST_BV, "Start battery self-test",
+          "Write Active to start one quick battery self-test. The load runs "
+          "on battery for a few seconds. At most one every 30 minutes.",
+          "Start test" },
+        { DEEPTEST_BV, "Start deep battery test",
+          "Write Active to start a runtime calibration. This runs the battery "
+          "down to its low-battery level -- over an hour on a lightly loaded "
+          "unit -- and the site is unprotected if the mains fails meanwhile. "
+          "Needs its own permission on the board. At most one a day.",
+          "Start deep test" },
+        { STOPTEST_BV, "Stop battery test",
+          "Write Active to stop a test that is running. Never rate limited.",
+          "Stop" },
+    };
+
     Binary_Value_Write_Present_Value_Callback_Set(bv_written);
-    /* Both branches explicitly. Binary_Value_Create() enables writes by
-     * default, and leaning on that would make the opt-in depend on a default
-     * inside vendored code. */
-    if (out_common_cmd_enabled()) Binary_Value_Write_Enable(bv);
-    else                          Binary_Value_Write_Disable(bv);
+    for (unsigned k = 0; k < sizeof BV / sizeof BV[0]; k++) {
+        const uint32_t bv = Binary_Value_Create(BV[k].inst);
+        Binary_Value_Name_Set(bv, BV[k].name);
+        Binary_Value_Description_Set(bv, BV[k].desc);
+        /* Worth setting: a BMS shows these instead of "Active"/"Inactive",
+         * and the verb on a momentary point is the difference between an
+         * operator knowing what a write does and guessing. */
+        Binary_Value_Active_Text_Set(bv, BV[k].on);
+        Binary_Value_Inactive_Text_Set(bv, "Idle");
+        Binary_Value_Present_Value_Set(bv, BINARY_INACTIVE);
+        /* Each to its own permission, and both branches explicitly:
+         * Binary_Value_Create() enables writes by default, and leaning on
+         * that would make the opt-in depend on a default inside vendored
+         * code. Stop answers to either, because a board that accepts any
+         * command must be able to take it back. */
+        const bool may = (BV[k].inst == DEEPTEST_BV) ? out_common_deep_enabled()
+                       : (BV[k].inst == STOPTEST_BV)
+                             ? (out_common_cmd_enabled() || out_common_deep_enabled())
+                             : out_common_cmd_enabled();
+        if (may) Binary_Value_Write_Enable(bv);
+        else     Binary_Value_Write_Disable(bv);
+    }
 }
 
 /* Copies the shared snapshot into the objects. Same cadence and same source
@@ -638,6 +695,8 @@ esp_err_t out_bacnet_start(void)
                   "BV%d self-test %s",
              OUT_DISCRETE_N, OUT_DISCRETE_N - 1, SELFTEST_BV,
              out_common_cmd_enabled() ? "WRITABLE" : "write-disabled");
+    ESP_LOGI(TAG, "BV%d deep test %s, BV%d stop test", DEEPTEST_BV,
+             out_common_deep_enabled() ? "WRITABLE" : "write-disabled", STOPTEST_BV);
     return ESP_OK;
 }
 

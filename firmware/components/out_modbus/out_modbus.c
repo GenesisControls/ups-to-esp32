@@ -30,6 +30,13 @@ static const char *TAG = "out_mb";
  *
  * Write 1 to start. It self-clears, so it is a trigger and not a state; a
  * master that leaves it set does not re-fire. */
+/* Three of them now, in one byte, so the area descriptor is unchanged: one
+ * uint8_t is eight coils and only the low three mean anything.
+ *
+ *   100  start a quick self-test       seconds on battery
+ *   101  start a DEEP test             runtime calibration, its own opt-in
+ *   102  stop whatever is running      the safe one; never rate limited
+ */
 #define CMD_COIL_ADDR   100
 
 /* 2.x asks for a response timeout per instance. This is how long the stack
@@ -88,7 +95,7 @@ static uint8_t  s_cmd;          /* the command coil's one byte */
  * not have it", which a commissioning engineer needs. */
 typedef struct { uint16_t first, count; } block_t;
 static const block_t REG_BLOCKS[] = {
-    { 0,  12 },     /* 0-11  : the UPS. 0-7 are live in Niagara today */
+    { 0,  13 },     /* 0-12  : the UPS. 0-7 are live in Niagara today */
     { 16, 3  },     /* 16-18 : the adapter */
 };
 
@@ -125,19 +132,38 @@ static void refresh(void)
  * coils are MB_ACCESS_RO and the stack itself refuses the write. Only the
  * command coil is writable, because cmd_check() has to see what was written
  * in order to refuse it on its own terms. */
-/* Coil 100 went high. out_common does the refusing, for every transport, and
- * logs whichever guard said no; all that is left here is the trigger
- * semantics and this instance's count. */
+/* A command coil went high. out_common does the refusing, for every
+ * transport, and logs whichever guard said no; all that is left here is the
+ * trigger semantics and this instance's count.
+ *
+ * All three are drained in one pass. A master that sets two in the same write
+ * gets both answered in order rather than one silently dropped -- and since
+ * stop comes last, "start and stop in one frame" ends stopped, which is the
+ * safer of the two readings. */
 static void cmd_check(inst_t *in)
 {
-    if (!(s_cmd & 1u)) return;
+    const uint8_t c = s_cmd;
+    if (!c) return;
     s_cmd = 0;                                  /* a trigger, not a state */
 
-    if (out_common_request_selftest("Modbus coil 100") != ESP_OK) return;
+    static const struct {
+        uint8_t     bit;
+        out_test_t  which;
+        const char *via;
+    } CMD[] = {
+        { 1u << 0, OUT_TEST_QUICK, "Modbus coil 100" },
+        { 1u << 1, OUT_TEST_DEEP,  "Modbus coil 101" },
+        { 1u << 2, OUT_TEST_STOP,  "Modbus coil 102" },
+    };
 
-    xSemaphoreTake(in->lock, portMAX_DELAY);
-    in->stat.tests_started++;
-    xSemaphoreGive(in->lock);
+    for (unsigned k = 0; k < sizeof CMD / sizeof CMD[0]; k++) {
+        if (!(c & CMD[k].bit)) continue;
+        if (out_common_request_test(CMD[k].which, CMD[k].via) != ESP_OK) continue;
+        if (CMD[k].which == OUT_TEST_STOP) continue;   /* a stop is not a test */
+        xSemaphoreTake(in->lock, portMAX_DELAY);
+        in->stat.tests_started++;
+        xSemaphoreGive(in->lock);
+    }
 }
 
 static void mb_task(void *arg)

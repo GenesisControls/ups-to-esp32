@@ -397,7 +397,7 @@ static esp_err_t get_status(httpd_req_t *req)
         n += snprintf(AT(n), ROOM(n),
                   ",\"bus\":{\"proto\":%d,\"tcp_en\":%s,"
                   "\"has485\":%s,\"ip\":%s,"
-                  "\"address\":%d,\"baud\":%d,\"format\":%d,\"cmd\":%s,"
+                  "\"address\":%d,\"baud\":%d,\"format\":%d,\"cmd\":%s,\"deep\":%s,"
                   "\"devid\":%lu,\"devid_set\":%lu,\"devname\":\"%s\","
                   "\"infofr\":%d,\"maxmast\":%d,\"mbport\":%d,\"tcpuid\":%d",
                   (int)out_common_proto(),
@@ -407,6 +407,7 @@ static esp_err_t get_status(httpd_req_t *req)
                   out_common_address(), out_common_baud(),
                   (int)out_common_format(),
                   out_common_cmd_enabled() ? "true" : "false",
+                  out_common_deep_enabled() ? "true" : "false",
                   (unsigned long)(bac.instance ? bac.instance : out_common_device_id()),
                   (unsigned long)out_common_device_id(),
                   jesc(bac.device_name, e1, sizeof(e1)),
@@ -1486,6 +1487,11 @@ static esp_err_t post_bus(httpd_req_t *req)
     if (!why && cJSON_IsBool(jc) &&
         out_common_set_cmd_enabled(cJSON_IsTrue(jc)) != ESP_OK) {
         why = "could not save the command setting";
+    }
+    const cJSON *jd = cJSON_GetObjectItemCaseSensitive(root, "deep");
+    if (!why && cJSON_IsBool(jd) &&
+        out_common_set_deep_enabled(cJSON_IsTrue(jd)) != ESP_OK) {
+        why = "could not save the deep-test setting";
     }
 
     cJSON_Delete(root);

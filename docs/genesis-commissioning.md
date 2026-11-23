@@ -220,8 +220,13 @@ Worth knowing before you look for it:
 - **Days since battery change** (register 8, AI9) — reads *not available*.
   It needs a real clock and this board has none yet. Discrete 9, the battery
   age alarm, depends on it and is therefore always false.
-- **Writes of any kind**, apart from the self-test trigger — Modbus coil 100
-  or BACnet BV1 — which is **on** by default. One quick test per half hour per
-  board, refused unless the UPS says it can self-test. Untick *allow a battery
-  self-test to be started from the bus* on the RS485 / BMS card to refuse it.
+- **Writes of any kind**, apart from three triggers on the RS485 / BMS card:
+  the quick self-test (coil 100 / BV1, **on** by default, one per half hour),
+  the **deep test** (coil 101 / BV2, **off** by default and with its own
+  tick-box, one per day), and stop (coil 102 / BV3, no limit). All three are
+  refused unless the UPS says it can self-test.
+
+  Think before ticking the deep one: it runs the battery down to its
+  low-battery level, which on a lightly loaded UPS is well over an hour with
+  the site unprotected if the mains fails meanwhile.
 - **Check-in / telemetry** — compiled out. This board reports to nobody.
