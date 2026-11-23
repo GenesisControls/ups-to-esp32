@@ -71,11 +71,6 @@ static const char *TAG = "out_bac";
 #include "bacnet/datalink/mstp.h"
 #include "bacnet/npdu.h"
 
-/* MS/TP's own default, and the brief's. 127 is the highest legal master
- * address, which is where a device goes when nobody has assigned it one. */
-#define MAX_MASTER_DEFAULT  127
-#define MAX_INFO_FRAMES     1
-
 /* Registers that exist in Modbus but have no business being an AI:
  *
  *   7  status bitfield -- every bit of it is already BI1..BI6. A float whose
@@ -158,7 +153,14 @@ static uint32_t device_instance_from_mac(char *name, size_t cap)
     uint8_t mac[6] = { 0 };
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     snprintf(name, cap, "UPS-%02X%02X", mac[4], mac[5]);
-    return ((uint32_t)mac[3] << 16 | (uint32_t)mac[4] << 8 | mac[5]) & 0x3FFFFFu;
+
+    /* The configured instance wins; 0 means derive. The object NAME is always
+     * derived, because it identifies the hardware rather than its place in a
+     * numbering plan -- two adapters given the same instance by mistake are
+     * much easier to tell apart if their names still differ. */
+    const uint32_t configured = out_common_device_id();
+    if (configured != OUT_DEVID_DERIVE) return configured;
+    return ((uint32_t)mac[3] << 16 | (uint32_t)mac[4] << 8 | mac[5]) & OUT_DEVID_MAX;
 }
 
 static void create_objects(void)
@@ -281,8 +283,10 @@ esp_err_t out_bacnet_start(void)
 
     bacnet_rs485_baud_set((uint32_t)baud);
 
-    s_mstp.Nmax_info_frames = MAX_INFO_FRAMES;
-    s_mstp.Nmax_master      = MAX_MASTER_DEFAULT;
+    const int info_frames = out_common_info_frames();
+    const int max_master   = out_common_max_master();
+    s_mstp.Nmax_info_frames = (uint8_t)info_frames;
+    s_mstp.Nmax_master      = (uint8_t)max_master;
     s_mstp.InputBuffer      = s_in;
     s_mstp.InputBufferSize  = sizeof(s_in);
     s_mstp.OutputBuffer     = s_out;
@@ -305,8 +309,8 @@ esp_err_t out_bacnet_start(void)
     }
     dlmstp_set_mac_address((uint8_t)mac);
     dlmstp_set_baud_rate((uint32_t)baud);
-    dlmstp_set_max_master(MAX_MASTER_DEFAULT);
-    dlmstp_set_max_info_frames(MAX_INFO_FRAMES);
+    dlmstp_set_max_master((uint8_t)max_master);
+    dlmstp_set_max_info_frames((uint8_t)info_frames);
 
     apdu_set_unrecognized_service_handler_handler(handler_unrecognized_service);
     apdu_set_unconfirmed_handler(SERVICE_UNCONFIRMED_WHO_IS, handler_who_is);
@@ -332,6 +336,8 @@ esp_err_t out_bacnet_start(void)
     s_stat.mac      = mac;
     s_stat.baud     = baud;
     s_stat.instance = instance;
+    s_stat.info_frames = info_frames;
+    s_stat.max_master  = max_master;
     strlcpy(s_stat.device_name, dev_name, sizeof(s_stat.device_name));
     xSemaphoreGive(s_stat_lock);
 
@@ -342,8 +348,11 @@ esp_err_t out_bacnet_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "BACnet MS/TP up: %s, device instance %lu, MAC %d, %d baud 8N1",
-             dev_name, (unsigned long)instance, mac, baud);
+    ESP_LOGI(TAG, "BACnet MS/TP up: %s, device instance %lu%s, MAC %d, %d baud 8N1, "
+                  "max master %d, %d info frame%s",
+             dev_name, (unsigned long)instance,
+             out_common_device_id() == OUT_DEVID_DERIVE ? " (derived)" : " (configured)",
+             mac, baud, max_master, info_frames, info_frames == 1 ? "" : "s");
     ESP_LOGI(TAG, "BI1-BI%d from discretes 0-%d, AI from registers (+1), read-only",
              OUT_DISCRETE_N, OUT_DISCRETE_N - 1);
     return ESP_OK;

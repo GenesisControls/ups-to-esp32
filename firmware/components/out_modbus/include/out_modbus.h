@@ -38,6 +38,7 @@ typedef struct {
     int      address;
     int      baud;            /* the rate in use, resolved from auto */
     const char *format;       /* "8N1" and friends, as actually configured */
+    int      port;            /* TCP only: the listening port. 0 on RTU. */
     uint32_t requests;        /* frames addressed to us and answered */
     uint32_t writes_refused;  /* writes to read-only addresses; undone */
     uint32_t tests_started;   /* self-tests triggered from the bus */

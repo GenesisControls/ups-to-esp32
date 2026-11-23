@@ -22,7 +22,9 @@ typedef struct {
     bool     running;
     int      mac;                /* MS/TP station address, 0-127 */
     int      baud;
-    uint32_t instance;           /* BACnet device object instance */
+    uint32_t instance;           /* BACnet device object instance, as in use */
+    int      info_frames;        /* Nmax_info_frames actually applied */
+    int      max_master;         /* Nmax_master actually applied */
     char     device_name[32];    /* what a BMS discovers us as */
     uint32_t requests;           /* NPDUs handled since boot */
     int64_t  last_request_us;    /* esp_timer stamp, 0 if never */

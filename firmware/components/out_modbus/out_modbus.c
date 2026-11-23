@@ -304,10 +304,11 @@ static esp_err_t start_tcp(int addr)
      * the serial arm's must be left alone. ip_addr NULL accepts any client --
      * the brief's allowed-client list is a later setting, and until it exists
      * the honest position is that anything on that LAN can read this. */
+    const int port = out_common_mb_tcp_port();
     mb_communication_info_t comm = {
         .ip_mode      = MB_MODE_TCP,
         .slave_uid    = (uint8_t)addr,
-        .ip_port      = CONFIG_FMB_TCP_PORT_DEFAULT,
+        .ip_port      = (uint16_t)port,
         .ip_addr_type = MB_IPV4,
         .ip_addr      = NULL,
         .ip_netif_ptr = netif,
@@ -323,13 +324,14 @@ static esp_err_t start_tcp(int addr)
     s_stat.address = addr;
     s_stat.baud    = 0;                 /* a socket has no baud rate */
     s_stat.format  = "TCP";
+    s_stat.port    = port;
     xSemaphoreGive(s_stat_lock);
 
     if (xTaskCreate(mb_task, "out_mb", 3072, NULL, 4, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG, "Modbus TCP slave up: unit %d on port %d, up to %d masters",
-             addr, CONFIG_FMB_TCP_PORT_DEFAULT, CONFIG_FMB_TCP_PORT_MAX_CONN);
+             addr, port, CONFIG_FMB_TCP_PORT_MAX_CONN);
     ESP_LOGI(TAG, "bus commands %s (coil %d starts a quick self-test)",
              out_common_cmd_enabled() ? "ENABLED" : "off", CMD_COIL_ADDR);
     return ESP_OK;

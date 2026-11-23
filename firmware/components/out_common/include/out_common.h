@@ -103,17 +103,27 @@ out_proto_t out_common_proto(void);
 esp_err_t   out_common_set_proto(out_proto_t p);
 const char *out_common_proto_name(out_proto_t p);
 
-/* The station address, shared by Modbus RTU's slave/unit ID and BACnet
- * MS/TP's MAC because a site thinks of it as one number: "which device is
- * this on the trunk". Default 4.
+/* The station address. One stored number for all four protocols, because a
+ * site thinks of it as one thing -- "which device is this" -- even though each
+ * protocol names it differently. The page labels it per transport: MAC on the
+ * serial trunks, Unit ID over Modbus TCP. Default 4.
  *
- * Valid 1-247 for Modbus, 0-127 for MS/TP masters, so 1-127 is safe for
- * both and is what this accepts. Two adapters on one segment at the same
- * address collide silently, so deriving a default from the MAC -- as the AP
- * SSID already does -- is worth revisiting if these ever share a trunk. */
+ * The VALID RANGE DEPENDS ON THE PROTOCOL: 1-247 for Modbus (RTU and TCP),
+ * 0-127 for a BACnet MS/TP master, since MS/TP's token passing cannot address
+ * above 127. So 200 is a legal Modbus unit ID and an illegal MS/TP MAC, and
+ * switching protocol can invalidate an address that was fine before -- which
+ * is why out_common_address_valid() takes the protocol, and why the two must
+ * be validated together rather than one after the other. Clamping silently
+ * would be worse than refusing: the BMS would still be polling the old
+ * address and the trunk would just go quiet.
+ *
+ * Two adapters at one address on one segment collide silently, so deriving a
+ * default from the MAC -- as the AP SSID already does -- is worth revisiting
+ * if these ever share a trunk. */
 #define OUT_ADDR_DEFAULT 4
 int       out_common_address(void);
 esp_err_t out_common_set_address(int addr);
+bool      out_common_address_valid(int addr, out_proto_t p);
 
 /* 0 means autobaud: listen, lock on, and re-scan after silence. Anything else
  * is a fixed rate. Default 0. Autobaud is its own piece of work and does not
@@ -142,6 +152,62 @@ typedef enum {
 out_fmt_t   out_common_format(void);
 esp_err_t   out_common_set_format(out_fmt_t f);
 const char *out_common_format_name(out_fmt_t f);
+
+/* ---- BACnet ------------------------------------------------------------
+ *
+ * The BACnet device object instance: what a BMS discovers this adapter as,
+ * and the number an engineer types into a JACE. Unique across the whole
+ * BACnet internetwork, not just the trunk.
+ *
+ * 0 means DERIVE IT FROM THE CHIP MAC, which is the default and deliberately
+ * so. The alternative default is a constant, and a constant means twenty
+ * adapters shipping as the same instance -- most likely 12345, which is the
+ * value in every vendor's example code and therefore the one most likely to
+ * already be taken. A derived default is unique without anyone configuring
+ * it; the override is here for a site with its own numbering plan. */
+#define OUT_DEVID_DERIVE 0
+#define OUT_DEVID_MAX    4194303u      /* ASHRAE 135: 22 bits */
+uint32_t  out_common_device_id(void);          /* as stored: 0 = derive */
+esp_err_t out_common_set_device_id(uint32_t id);
+
+/* MS/TP, and MS/TP only -- both are token-passing parameters, and BACnet/IP
+ * has no token.
+ *
+ * max info frames: how many frames this node may send while it holds the
+ * token. 1 is the standard's own default and right for a device that mostly
+ * answers; raising it helps only if we originate a lot of traffic.
+ *
+ * max master: the highest MAC the token-passing algorithm searches for.
+ * Lowering it to just above the highest address actually on the segment
+ * speeds up token rotation measurably, because the poll-for-master sweep
+ * stops there instead of walking to 127. */
+#define OUT_INFOFRAMES_DEFAULT 1
+#define OUT_MAXMASTER_DEFAULT  127
+int       out_common_info_frames(void);
+esp_err_t out_common_set_info_frames(int n);
+int       out_common_max_master(void);
+esp_err_t out_common_set_max_master(int n);
+
+/* The BACnet network number this device sits on. 0 means "not configured",
+ * which is right for a flat site; it matters when a BACnet router joins
+ * segments and the BMS needs to know which network a device is reached
+ * through. */
+#define OUT_BACNET_NET_DEFAULT 0
+int       out_common_bacnet_net(void);
+esp_err_t out_common_set_bacnet_net(int n);
+
+/* ---- the IP ports ------------------------------------------------------
+ *
+ * Both default to their registered numbers and both are changeable, because
+ * a site that runs two BACnet or two Modbus devices behind one NAT, or whose
+ * firewall policy differs, has no other way out. Changing either means
+ * telling the BMS: nothing discovers a non-standard port by itself. */
+#define OUT_MB_TCP_PORT_DEFAULT 502
+#define OUT_BIP_PORT_DEFAULT    47808
+int       out_common_mb_tcp_port(void);
+esp_err_t out_common_set_mb_tcp_port(int port);
+int       out_common_bip_port(void);
+esp_err_t out_common_set_bip_port(int port);
 
 /* What register 6 does when the UPS link is lost. */
 typedef enum {

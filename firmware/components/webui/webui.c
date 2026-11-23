@@ -18,6 +18,7 @@
 #include "auth.h"
 #include "out_common.h"
 #include "out_modbus.h"
+#include "out_bacnet.h"
 #include "mbedtls/base64.h"
 #include "nvs.h"
 #include "board.h"
@@ -359,26 +360,52 @@ static esp_err_t get_status(httpd_req_t *req)
     {
         out_modbus_stat_t mb;
         out_modbus_get(&mb);
+        out_bacnet_stat_t bac;
+        out_bacnet_get(&bac);
+
+        /* WHICHEVER OUTPUT IS ACTUALLY RUNNING owns running/requests/quiet.
+         * Reading them from out_modbus unconditionally would tell a board
+         * serving MS/TP that its protocol "is selected but not running",
+         * because the Modbus stat is all zeroes on that board. The
+         * Modbus-only counters below stay Modbus-only: a write refused and a
+         * per-access-type read count have no BACnet equivalent, so they are
+         * zero there rather than faked. */
+        const bool on_bac = out_common_proto() == OUT_PROTO_BACNET_MSTP;
+        const bool running = on_bac ? bac.running : mb.running;
+        const uint32_t reqs = on_bac ? bac.requests : mb.requests;
+        const int64_t  last = on_bac ? bac.last_request_us : mb.last_request_us;
+
         n += snprintf(AT(n), ROOM(n),
                   ",\"bus\":{\"proto\":%d,\"address\":%d,\"baud\":%d,\"format\":%d,"
                   "\"rs485\":%s,\"ip\":%s,\"running\":%s,"
                   "\"requests\":%u,\"writes\":%u,\"quiet_s\":%lld,"
                   "\"per_min\":%u,\"collisions\":%u,\"tests\":%u,"
-                  "\"rd\":[%u,%u,%u,%u],\"cmd\":%s}",
+                  "\"rd\":[%u,%u,%u,%u],\"cmd\":%s,"
+                  "\"devid\":%lu,\"devid_set\":%lu,\"devname\":\"%s\","
+                  "\"infofr\":%d,\"maxmast\":%d,\"bacnet_net\":%d,"
+                  "\"mbport\":%d,\"bipport\":%d,\"port\":%d}",
                   (int)out_common_proto(), out_common_address(), out_common_baud(),
                   (int)out_common_format(),
                   BOARD_HAS_RS485 ? "true" : "false",
                   netmgr_state() == NETMGR_STA_CONNECTED ? "true" : "false",
-                  mb.running ? "true" : "false",
-                  (unsigned)mb.requests, (unsigned)mb.writes_refused,
-                  mb.last_request_us
-                      ? (long long)((esp_timer_get_time() - mb.last_request_us) / 1000000)
-                      : -1LL,
+                  running ? "true" : "false",
+                  (unsigned)reqs, (unsigned)mb.writes_refused,
+                  last ? (long long)((esp_timer_get_time() - last) / 1000000) : -1LL,
                   (unsigned)mb.per_min, (unsigned)mb.collisions,
                   (unsigned)mb.tests_started,
                   (unsigned)mb.rd_input, (unsigned)mb.rd_holding,
                   (unsigned)mb.rd_discrete, (unsigned)mb.rd_coil,
-                  out_common_cmd_enabled() ? "true" : "false");
+                  out_common_cmd_enabled() ? "true" : "false",
+                  /* devid is what is IN USE (derived or configured); devid_set
+                   * is what is stored, so the page can show "derived" rather
+                   * than pretending the number was typed in. */
+                  (unsigned long)(bac.instance ? bac.instance : out_common_device_id()),
+                  (unsigned long)out_common_device_id(),
+                  jesc(bac.device_name, e1, sizeof(e1)),
+                  out_common_info_frames(), out_common_max_master(),
+                  out_common_bacnet_net(),
+                  out_common_mb_tcp_port(), out_common_bip_port(),
+                  on_bac ? 0 : mb.port);
     }
 #if CONFIG_UPSA_TAILSCALE
     /* Present only in a Tailscale build, so the page can tell "not in this
@@ -1293,8 +1320,22 @@ static esp_err_t post_ota_upload(httpd_req_t *req)
     return httpd_resp_send(req, "{\"ok\":true,\"installed\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
-/* {"proto":n,"address":n,"baud":n} -- which protocol is on the trunk, and
- * the two settings a site actually changes.
+/* One optional integer from the body, or the value already in force, so a
+ * partial POST changes only what it mentions. */
+#define BUS_INT(root, name, fallback)                                          \
+    (cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive((root), (name)))           \
+         ? cJSON_GetObjectItemCaseSensitive((root), (name))->valueint           \
+         : (fallback))
+
+/* Applies one optional integer setting, stopping at the first refusal. */
+#define BUS_SET(root, name, call, msg)                                         \
+    do {                                                                       \
+        const cJSON *jj = cJSON_GetObjectItemCaseSensitive((root), (name));    \
+        if (!why && cJSON_IsNumber(jj) && (call) != ESP_OK) why = (msg);        \
+    } while (0)
+
+/* The bus settings. Which protocol is on the trunk, and everything a site
+ * actually changes about it.
  *
  * Nothing is started or stopped here. An output holding a UART cannot be
  * swapped under a live trunk safely, and a BMS watching a device disappear
@@ -1303,48 +1344,83 @@ static esp_err_t post_ota_upload(httpd_req_t *req)
 static esp_err_t post_bus(httpd_req_t *req)
 {
     if (!may_write(req)) return ESP_OK;
-    char body[160];
-    int got = read_body(req, body, sizeof(body));
-    if (got < 0) return ESP_FAIL;
+    char body[384];                 /* nine fields now, not three */
+    if (read_body(req, body, sizeof(body)) < 0) return ESP_FAIL;
     cJSON *root = cJSON_Parse(body);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "not JSON"); return ESP_FAIL; }
 
-    const cJSON *jp = cJSON_GetObjectItemCaseSensitive(root, "proto");
-    const cJSON *ja = cJSON_GetObjectItemCaseSensitive(root, "address");
-    const cJSON *jb = cJSON_GetObjectItemCaseSensitive(root, "baud");
-    esp_err_t e = ESP_OK;
     const char *why = NULL;
 
-    if (cJSON_IsNumber(ja) && (e = out_common_set_address(ja->valueint)) != ESP_OK) {
-        why = "address must be 1-127 (valid for both Modbus and MS/TP)";
-    } else if (cJSON_IsNumber(jb) && (e = out_common_set_baud(jb->valueint)) != ESP_OK) {
-        why = "baud must be 0 (auto), 9600, 19200, 38400, 57600, 76800 or 115200";
-    } else if (cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive(root, "format")) &&
-               (e = out_common_set_format(
-                    (out_fmt_t)cJSON_GetObjectItemCaseSensitive(root, "format")->valueint)) != ESP_OK) {
-        why = "data format must be 8N1, 8E1, 8O1 or 8N2";
-    } else if (cJSON_IsBool(cJSON_GetObjectItemCaseSensitive(root, "cmd")) &&
-               (e = out_common_set_cmd_enabled(
-                    cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "cmd")))) != ESP_OK) {
-        why = "could not save the command setting";
-    } else if (cJSON_IsNumber(jp)) {
-        int p = jp->valueint;
-        if (p == OUT_PROTO_BACNET_IP) {
-            /* In the enum, served by nothing: out_bacnet compiles the MS/TP
-             * datalink only (BACDL_MSTP), so BACnet/IP would leave the board
-             * silent while the page named a protocol. Refused here as well as
-             * greyed out on the page. */
-            why = "BACnet/IP is not in this firmware yet";
-        } else if ((p == OUT_PROTO_MODBUS_RTU || p == OUT_PROTO_BACNET_MSTP) &&
-                   !BOARD_HAS_RS485) {
-            why = "this board has no RS485 transceiver";
-        } else if (p == OUT_PROTO_MODBUS_TCP &&
-                   netmgr_state() != NETMGR_STA_CONNECTED) {
-            why = "Modbus TCP needs the board to have joined a network";
-        } else if ((e = out_common_set_proto((out_proto_t)p)) != ESP_OK) {
-            why = "not a protocol this firmware knows";
-        }
+    /* PROTOCOL AND ADDRESS ARE CHECKED AS A PAIR, before anything is stored.
+     * The legal address range depends on the protocol -- 1-247 for Modbus,
+     * 0-127 for an MS/TP master -- so checking them one after the other makes
+     * a perfectly legal combination succeed or fail depending on which field
+     * happened to be validated first, and can leave the board half-changed
+     * when the second is refused. Switching to MS/TP with address 200 stored
+     * is the case that matters: refuse it and say why, rather than clamp to
+     * something the BMS is not polling. */
+    const int want_proto = BUS_INT(root, "proto", (int)out_common_proto());
+    const int want_addr  = BUS_INT(root, "address", out_common_address());
+
+    if (want_proto < OUT_PROTO_NONE || want_proto > OUT_PROTO_BACNET_IP) {
+        why = "not a protocol this firmware knows";
+    } else if (want_proto == OUT_PROTO_BACNET_IP) {
+        /* In the enum, served by nothing: out_bacnet compiles the MS/TP
+         * datalink only (BACDL_MSTP). Its settings are stored and validated
+         * so the datalink needs no second settings pass, but selecting it
+         * would leave the board silent while the page named a protocol. */
+        why = "BACnet/IP is not in this firmware yet";
+    } else if ((want_proto == OUT_PROTO_MODBUS_RTU ||
+                want_proto == OUT_PROTO_BACNET_MSTP) && !BOARD_HAS_RS485) {
+        why = "this board has no RS485 transceiver";
+    } else if (want_proto == OUT_PROTO_MODBUS_TCP &&
+               netmgr_state() != NETMGR_STA_CONNECTED) {
+        why = "Modbus TCP needs the board to have joined a network";
+    } else if (!out_common_address_valid(want_addr, (out_proto_t)want_proto)) {
+        why = (want_proto == OUT_PROTO_BACNET_MSTP)
+                  ? "a BACnet MS/TP MAC must be 0-127"
+                  : "a Modbus address must be 1-247";
     }
+
+    /* ORDER MATTERS: the protocol goes in FIRST.
+     *
+     * out_common_set_address() validates against the protocol in force, so
+     * writing the address first lets the OLD protocol judge the NEW address.
+     * Changing MS/TP (MAC 100) to Modbus TCP (unit 200) would then pass the
+     * pair check above and be refused by the setter, because MS/TP's 0-127
+     * limit still applied at that moment. Protocol first, and the address is
+     * judged by the protocol it will actually run under -- which the pair
+     * check has already approved, so the only way it fails here is NVS. */
+    if (!why && out_common_set_proto((out_proto_t)want_proto) != ESP_OK) {
+        why = "could not save the protocol";
+    }
+    if (!why && out_common_set_address(want_addr) != ESP_OK) {
+        why = "could not save the address";
+    }
+
+    BUS_SET(root, "baud", out_common_set_baud(jj->valueint),
+            "baud must be 0 (auto), 9600, 19200, 38400, 57600, 76800 or 115200");
+    BUS_SET(root, "format", out_common_set_format((out_fmt_t)jj->valueint),
+            "data format must be 8N1, 8E1, 8O1 or 8N2");
+    BUS_SET(root, "devid", out_common_set_device_id((uint32_t)jj->valueint),
+            "the device ID must be 0 (derive from the MAC) or up to 4194303");
+    BUS_SET(root, "infofr", out_common_set_info_frames(jj->valueint),
+            "max info frames must be 1-255");
+    BUS_SET(root, "maxmast", out_common_set_max_master(jj->valueint),
+            "max master must be 0-127");
+    BUS_SET(root, "bacnet_net", out_common_set_bacnet_net(jj->valueint),
+            "the BACnet network number must be 0-65534");
+    BUS_SET(root, "mbport", out_common_set_mb_tcp_port(jj->valueint),
+            "the Modbus TCP port must be 1-65535");
+    BUS_SET(root, "bipport", out_common_set_bip_port(jj->valueint),
+            "the BACnet/IP port must be 1-65535");
+
+    const cJSON *jc = cJSON_GetObjectItemCaseSensitive(root, "cmd");
+    if (!why && cJSON_IsBool(jc) &&
+        out_common_set_cmd_enabled(cJSON_IsTrue(jc)) != ESP_OK) {
+        why = "could not save the command setting";
+    }
+
     cJSON_Delete(root);
     if (why) return send_err(req, why);
     httpd_resp_set_type(req, "application/json");

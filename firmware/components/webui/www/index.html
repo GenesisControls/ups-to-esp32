@@ -639,31 +639,87 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
       <label for="bus-proto">Protocol</label>
       <select id="bus-proto"></select>
       <p class="note">Modbus RTU, Modbus TCP and BACnet MS/TP work. BACnet/IP stays greyed out:
-        its datalink is not compiled into this firmware. On BACnet MS/TP the data format below
-        does not apply &mdash; ANSI/ASHRAE 135 fixes MS/TP at 8 data bits, no parity, 1 stop bit.</p>
-      <label for="bus-addr">Address <span class="note">(Modbus unit ID, or BACnet MS/TP MAC &mdash; 1 to 127)</span></label>
-      <input id="bus-addr" inputmode="numeric" autocomplete="off">
-      <label for="bus-fmt">Data format</label>
-      <select id="bus-fmt">
-        <option value="1">8N1 &mdash; no parity, 1 stop bit</option>
-        <option value="2">8E1 &mdash; even parity</option>
-        <option value="3">8O1 &mdash; odd parity</option>
-        <option value="4">8N2 &mdash; no parity, 2 stop bits</option>
-      </select>
-      <label for="bus-baud">Baud</label>
-      <select id="bus-baud">
-        <option value="0">auto</option>
-        <option value="9600">9600</option>
-        <option value="19200">19200</option>
-        <option value="38400">38400</option>
-        <option value="57600">57600</option>
-        <option value="76800">76800</option>
-        <option value="115200">115200</option>
-      </select>
-      <label class="chk"><input type="checkbox" id="bus-cmd"> allow a battery self-test to be started from the bus</label>
-      <p class="note">Writing <b>coil 100</b> starts one quick test &mdash; refused unless the UPS
-        reports it can self-test, and at most one every 30 minutes. Everything else on the bus
-        stays read-only.</p>
+        its datalink is not compiled into this firmware. Only the settings the chosen protocol
+        actually uses are shown.</p>
+
+      <div id="f-addr">
+        <label for="bus-addr"><span id="bus-addr-label">Address</span> <span class="note" id="bus-addr-hint"></span></label>
+        <input id="bus-addr" inputmode="numeric" autocomplete="off">
+      </div>
+
+      <div id="f-devid">
+        <label for="bus-devid">Device ID <span class="note">(BACnet device object instance)</span></label>
+        <input id="bus-devid" inputmode="numeric" autocomplete="off">
+        <p class="note"><b>0</b> derives it from this board&rsquo;s MAC, which is the default and
+          gives every adapter a different one without anyone assigning it. Set a number only if
+          the site has its own numbering plan &mdash; it must be unique across the whole BACnet
+          internetwork, not just this trunk. <span id="bus-devid-now"></span></p>
+      </div>
+
+      <div id="f-fmt">
+        <label for="bus-fmt">Data format</label>
+        <select id="bus-fmt">
+          <option value="1">8N1 &mdash; no parity, 1 stop bit</option>
+          <option value="2">8E1 &mdash; even parity</option>
+          <option value="3">8O1 &mdash; odd parity</option>
+          <option value="4">8N2 &mdash; no parity, 2 stop bits</option>
+        </select>
+      </div>
+
+      <div id="f-baud">
+        <label for="bus-baud">Baud</label>
+        <select id="bus-baud">
+          <option value="0">auto</option>
+          <option value="9600">9600</option>
+          <option value="19200">19200</option>
+          <option value="38400">38400</option>
+          <option value="57600">57600</option>
+          <option value="76800">76800</option>
+          <option value="115200">115200</option>
+        </select>
+      </div>
+
+      <div id="f-mstp">
+        <label for="bus-infofr">Max info frames <span class="note">(1 to 255)</span></label>
+        <input id="bus-infofr" inputmode="numeric" autocomplete="off">
+        <label for="bus-maxmast">Max master <span class="note">(0 to 127)</span></label>
+        <input id="bus-maxmast" inputmode="numeric" autocomplete="off">
+        <p class="note">Token-passing settings, MS/TP only. <b>Max info frames</b> is how many
+          frames this device may send while it holds the token; 1 is the standard&rsquo;s default
+          and right for a device that mostly answers. <b>Max master</b> is the highest MAC the
+          token search reaches &mdash; setting it just above the highest address actually on the
+          segment speeds up token rotation, because the sweep stops there instead of walking
+          to 127.</p>
+      </div>
+
+      <div id="f-bnet">
+        <label for="bus-bnet">BACnet network <span class="note">(0 to 65534)</span></label>
+        <input id="bus-bnet" inputmode="numeric" autocomplete="off">
+        <p class="note">0 means not configured, which is right for a flat site. It matters when a
+          BACnet router joins segments.</p>
+      </div>
+
+      <div id="f-mbport">
+        <label for="bus-mbport">TCP port</label>
+        <input id="bus-mbport" inputmode="numeric" autocomplete="off">
+        <p class="note">502 is the registered Modbus port and what a BMS tries first. Change it
+          and you must tell the BMS &mdash; nothing discovers a non-standard port.</p>
+      </div>
+
+      <div id="f-bipport">
+        <label for="bus-bipport">UDP port</label>
+        <input id="bus-bipport" inputmode="numeric" autocomplete="off">
+        <p class="note">47808 (0xBAC0) is the registered BACnet/IP port. Change it and you must
+          tell the BMS.</p>
+      </div>
+
+      <div id="f-cmd">
+        <label class="chk"><input type="checkbox" id="bus-cmd"> allow a battery self-test to be started from the bus</label>
+        <p class="note">Writing <b>coil 100</b> starts one quick test &mdash; refused unless the UPS
+          reports it can self-test, and at most one every 30 minutes. Everything else on the bus
+          stays read-only. Modbus only: there is no BACnet equivalent, because this device
+          exposes nothing writable.</p>
+      </div>
       <button class="btn" id="bus-save">Save</button>
       <button class="btn" id="bus-reboot">Restart board</button>
       <p class="note" id="bus-stat"></p>
@@ -2181,9 +2237,33 @@ if($('fwup-go')) $('fwup-go').onclick=async()=>{
 // logs "not implemented yet" for TCP, so offering the other three would let
 // someone pick one and get silence on the trunk while this page named a
 // protocol. They come back here as each one starts working.
+// Which settings each protocol actually uses. Showing the rest would invite
+// someone to set a parity for MS/TP (fixed at 8N1 by ANSI/ASHRAE 135) or a
+// baud rate for Modbus TCP, then wonder why it changed nothing.
+//
+// Driven by the DROPDOWN, not by the saved protocol, so the fields follow the
+// choice immediately rather than after a save and a restart.
+const BUS_FIELDS={
+  1:[],                                                  // none
+  2:['f-addr','f-baud','f-fmt','f-cmd'],                 // Modbus RTU
+  3:['f-addr','f-devid','f-baud','f-mstp'],              // BACnet MS/TP
+  4:['f-addr','f-mbport','f-cmd'],                       // Modbus TCP
+  5:['f-devid','f-bnet','f-bipport'],                    // BACnet/IP
+};
+const BUS_GROUPS=['f-addr','f-devid','f-fmt','f-baud','f-mstp','f-bnet','f-mbport','f-bipport','f-cmd'];
+function busFields(p){
+  const on=BUS_FIELDS[p]||[];
+  for(const g of BUS_GROUPS){ const el=$(g); if(el) el.hidden=!on.includes(g); }
+  // The same stored number, named as each transport names it.
+  const mstp=p===3;
+  $('bus-addr-label').textContent=(p===4)?'Unit ID':'MAC address';
+  $('bus-addr-hint').textContent=mstp?'(MS/TP station address, 0 to 127)'
+                                     :'(1 to 247)';
+}
 let busBuilt=null;
 function busUI(b){
-  const key=JSON.stringify([b.rs485,b.ip,b.proto,b.address,b.baud,b.format,b.cmd]);
+  const key=JSON.stringify([b.rs485,b.ip,b.proto,b.address,b.baud,b.format,b.cmd,
+                            b.devid_set,b.infofr,b.maxmast,b.bacnet_net,b.mbport,b.bipport]);
   if(busBuilt!==key){
     busBuilt=key;
     const opts=[[1,'none (nothing on the bus)']];
@@ -2199,7 +2279,18 @@ function busUI(b){
     $('bus-baud').value=String(b.baud===undefined?0:b.baud);
     $('bus-fmt').value=String(b.format||1);
     $('bus-cmd').checked=!!b.cmd;
+    $('bus-devid').value=String(b.devid_set===undefined?0:b.devid_set);
+    $('bus-infofr').value=String(b.infofr||1);
+    $('bus-maxmast').value=String(b.maxmast===undefined?127:b.maxmast);
+    $('bus-bnet').value=String(b.bacnet_net||0);
+    $('bus-mbport').value=String(b.mbport||502);
+    $('bus-bipport').value=String(b.bipport||47808);
+    busFields(+$('bus-proto').value||1);
   }
+  // What the device is actually using, which differs from the field whenever
+  // the field says 0.
+  $('bus-devid-now').textContent =
+    (b.devid_set===0 && b.devid) ? `In use now: ${b.devid}, derived from the MAC.` : '';
   // Index 0 is unused: the C enums start at 1 so a zero can never be
   // mistaken for a real choice that simply was not sent.
   const names=['','none','Modbus RTU','BACnet MS/TP','Modbus TCP','BACnet/IP'];
@@ -2211,12 +2302,15 @@ function busUI(b){
   // MS/TP is 8N1 by standard, whatever the Modbus data-format setting happens
   // to hold, so it must not print a stored parity it does not use.
   const onIp=b.proto===4||b.proto===5, mstp=b.proto===3;
+  // The port is configurable, so it must be read rather than written into the
+  // sentence -- a hardcoded 502 becomes a lie the moment anyone changes it.
+  const port=b.proto===5?(b.bipport||47808):(b.mbport||502);
   let st;
   if(!b.proto||b.proto===1) st='Nothing is being served. Pick a protocol and restart.';
   else if(!b.running) st=`${names[b.proto]} is selected but not running — restart to apply.`;
-  else if(b.quiet_s<0) st=onIp?'Listening on port 502. Nothing has connected yet.'
+  else if(b.quiet_s<0) st=onIp?`Listening on port ${port}. Nothing has connected yet.`
                              :`Running at ${b.baud||'auto'} baud. Nothing has polled this device yet.`;
-  else st=`Running ${onIp?'on port 502':`at ${b.baud} baud ${mstp?'8N1':fmts[b.format||1]}`} · ${b.requests} request${b.requests===1?'':'s'} · last ${b.quiet_s}s ago`
+  else st=`Running ${onIp?`on port ${port}`:`at ${b.baud} baud ${mstp?'8N1':fmts[b.format||1]}`} · ${b.requests} request${b.requests===1?'':'s'} · last ${b.quiet_s}s ago`
          + (b.writes?` · ${b.writes} write${b.writes===1?'':'s'} refused`:'');
   if(!b.ip) st+=' Modbus TCP and BACnet/IP appear once this board has joined a network.';
 
@@ -2253,11 +2347,19 @@ $('bus-reboot').onclick=async()=>{
   const r=await api('/api/reboot');
   toast(r.ok?'Restarting…':(r.error||'failed'));
 };
+// The fields follow the dropdown at once, before any save.
+$('bus-proto').onchange=()=>busFields(+$('bus-proto').value||1);
 $('bus-save').onclick=async()=>{
   const r=await api('/api/bus',{proto:+$('bus-proto').value,
                                 address:+$('bus-addr').value,
                                 baud:+$('bus-baud').value,
                                 format:+$('bus-fmt').value,
+                                devid:+$('bus-devid').value,
+                                infofr:+$('bus-infofr').value,
+                                maxmast:+$('bus-maxmast').value,
+                                bacnet_net:+$('bus-bnet').value,
+                                mbport:+$('bus-mbport').value,
+                                bipport:+$('bus-bipport').value,
                                 cmd:$('bus-cmd').checked});
   if(!r.ok){ toast(r.error||'failed'); return; }
   busBuilt=null; toast('Saved — restart to apply'); poll();

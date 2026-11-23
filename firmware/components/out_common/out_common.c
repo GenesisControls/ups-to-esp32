@@ -29,6 +29,12 @@ static const char *TAG = "outcom";
 #define KEY_BAUD        "oc_baud"
 #define KEY_FMT         "oc_fmt"
 #define KEY_CMD         "oc_cmd"
+#define KEY_DEVID       "oc_devid"
+#define KEY_INFOFR      "oc_infofr"
+#define KEY_MAXMAST     "oc_maxmast"
+#define KEY_BACNET      "oc_bacnet"
+#define KEY_MBPORT      "oc_mbport"
+#define KEY_BIPPORT     "oc_bipport"
 
 /* Comm-OK's threshold. The other track's README specifies 10 s, and upstream
  * independently arrives at the same number: FAILURES_BEFORE_RESET (5) polls
@@ -55,6 +61,12 @@ static int               s_addr = OUT_ADDR_DEFAULT;
 static int               s_baud = OUT_BAUD_AUTO;
 static out_fmt_t         s_fmt = OUT_FMT_8N1;
 static bool              s_cmd_enabled = true;   /* self-test from the bus */
+static uint32_t          s_devid = OUT_DEVID_DERIVE;
+static int               s_info_frames = OUT_INFOFRAMES_DEFAULT;
+static int               s_max_master = OUT_MAXMASTER_DEFAULT;
+static int               s_bacnet_net = OUT_BACNET_NET_DEFAULT;
+static int               s_mb_tcp_port = OUT_MB_TCP_PORT_DEFAULT;
+static int               s_bip_port = OUT_BIP_PORT_DEFAULT;
 
 /* ---- helpers ---------------------------------------------------------- */
 
@@ -280,6 +292,18 @@ static void load_settings(void)
     uint8_t fm = 0;
     if (nvs_get_u8(h, KEY_FMT, &fm) == ESP_OK &&
         fm >= OUT_FMT_8N1 && fm <= OUT_FMT_8N2) s_fmt = (out_fmt_t)fm;
+    uint32_t dv = 0;
+    if (nvs_get_u32(h, KEY_DEVID, &dv) == ESP_OK && dv <= OUT_DEVID_MAX) s_devid = dv;
+    uint8_t ifr = 0;
+    if (nvs_get_u8(h, KEY_INFOFR, &ifr) == ESP_OK && ifr >= 1) s_info_frames = ifr;
+    uint8_t mm = 0;
+    if (nvs_get_u8(h, KEY_MAXMAST, &mm) == ESP_OK && mm <= 127) s_max_master = mm;
+    uint16_t bn = 0;
+    if (nvs_get_u16(h, KEY_BACNET, &bn) == ESP_OK && bn <= 65534) s_bacnet_net = bn;
+    uint16_t mp = 0;
+    if (nvs_get_u16(h, KEY_MBPORT, &mp) == ESP_OK && mp >= 1) s_mb_tcp_port = mp;
+    uint16_t bp = 0;
+    if (nvs_get_u16(h, KEY_BIPPORT, &bp) == ESP_OK && bp >= 1) s_bip_port = bp;
     nvs_close(h);
 }
 
@@ -324,11 +348,32 @@ const char *out_common_proto_name(out_proto_t p)
 
 int out_common_address(void) { return s_addr; }
 
+bool out_common_address_valid(int addr, out_proto_t p)
+{
+    switch (p) {
+    case OUT_PROTO_BACNET_MSTP:
+        /* MS/TP token passing cannot address above 127 (ASHRAE 135, Nmax
+         * master), and 0 is a legal master address. */
+        return addr >= 0 && addr <= 127;
+    case OUT_PROTO_MODBUS_RTU:
+    case OUT_PROTO_MODBUS_TCP:
+        /* 1-247. 0 is the Modbus broadcast address and no device may own it;
+         * 248-255 are reserved. */
+        return addr >= 1 && addr <= 247;
+    default:
+        /* Nothing on the bus, or BACnet/IP where the address is an IP and
+         * this field is unused. Accept the widest range so a stored value
+         * survives a trip through "none". */
+        return addr >= 0 && addr <= 247;
+    }
+}
+
 esp_err_t out_common_set_address(int addr)
 {
-    /* 1-127: the overlap of Modbus RTU's 1-247 and MS/TP's 0-127 master
-     * range, so one number stays valid when the protocol is switched. */
-    if (addr < 1 || addr > 127) return ESP_ERR_INVALID_ARG;
+    /* Validated against the protocol in force. A caller changing BOTH must
+     * check the pair itself before setting either, or the order decides
+     * whether a legal combination is accepted -- see post_bus in webui. */
+    if (!out_common_address_valid(addr, s_proto)) return ESP_ERR_INVALID_ARG;
     esp_err_t e = put_u8(KEY_ADDR, (uint8_t)addr);
     if (e == ESP_OK) s_addr = addr;
     return e;
@@ -449,6 +494,85 @@ esp_err_t out_common_set_hb_policy(out_hb_policy_t p)
 }
 
 out_hb_policy_t out_common_hb_policy(void) { return s_hb; }
+
+uint32_t out_common_device_id(void) { return s_devid; }
+
+esp_err_t out_common_set_device_id(uint32_t id)
+{
+    if (id > OUT_DEVID_MAX) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t h;
+    esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (e != ESP_OK) return e;
+    nvs_set_u32(h, KEY_DEVID, id);
+    e = nvs_commit(h);
+    nvs_close(h);
+    if (e == ESP_OK) s_devid = id;
+    return e;
+}
+
+int out_common_info_frames(void) { return s_info_frames; }
+
+esp_err_t out_common_set_info_frames(int n)
+{
+    if (n < 1 || n > 255) return ESP_ERR_INVALID_ARG;
+    esp_err_t e = put_u8(KEY_INFOFR, (uint8_t)n);
+    if (e == ESP_OK) s_info_frames = n;
+    return e;
+}
+
+int out_common_max_master(void) { return s_max_master; }
+
+esp_err_t out_common_set_max_master(int n)
+{
+    if (n < 0 || n > 127) return ESP_ERR_INVALID_ARG;
+    esp_err_t e = put_u8(KEY_MAXMAST, (uint8_t)n);
+    if (e == ESP_OK) s_max_master = n;
+    return e;
+}
+
+/* u16 helper: the network number and the two ports are all 16-bit. */
+static esp_err_t put_u16(const char *key, uint16_t v)
+{
+    nvs_handle_t h;
+    esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (e != ESP_OK) return e;
+    nvs_set_u16(h, key, v);
+    e = nvs_commit(h);
+    nvs_close(h);
+    return e;
+}
+
+int out_common_bacnet_net(void) { return s_bacnet_net; }
+
+esp_err_t out_common_set_bacnet_net(int n)
+{
+    /* 65535 is reserved for a broadcast to all networks, so a device may not
+     * sit on it. */
+    if (n < 0 || n > 65534) return ESP_ERR_INVALID_ARG;
+    esp_err_t e = put_u16(KEY_BACNET, (uint16_t)n);
+    if (e == ESP_OK) s_bacnet_net = n;
+    return e;
+}
+
+int out_common_mb_tcp_port(void) { return s_mb_tcp_port; }
+
+esp_err_t out_common_set_mb_tcp_port(int port)
+{
+    if (port < 1 || port > 65535) return ESP_ERR_INVALID_ARG;
+    esp_err_t e = put_u16(KEY_MBPORT, (uint16_t)port);
+    if (e == ESP_OK) s_mb_tcp_port = port;
+    return e;
+}
+
+int out_common_bip_port(void) { return s_bip_port; }
+
+esp_err_t out_common_set_bip_port(int port)
+{
+    if (port < 1 || port > 65535) return ESP_ERR_INVALID_ARG;
+    esp_err_t e = put_u16(KEY_BIPPORT, (uint16_t)port);
+    if (e == ESP_OK) s_bip_port = port;
+    return e;
+}
 
 bool out_common_cmd_enabled(void) { return s_cmd_enabled; }
 
