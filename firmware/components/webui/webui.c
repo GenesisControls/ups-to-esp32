@@ -1403,8 +1403,13 @@ static esp_err_t post_bus(httpd_req_t *req)
         why = "the RS485 trunk carries Modbus RTU or BACnet MS/TP, or nothing";
     } else if (want_rs485 != OUT_PROTO_NONE && !BOARD_HAS_RS485) {
         why = "this board has no RS485 transceiver";
-    } else if (want_tcp && netmgr_state() != NETMGR_STA_CONNECTED) {
-        why = "Modbus TCP needs the board to have joined a network";
+    /* Modbus TCP is deliberately NOT gated on a joined network here. It is a
+     * stored intention, and the network is a runtime condition that changes
+     * after this request is over: a technician sets this up from the board's
+     * own access point, before it has joined anything. Refusing the setting
+     * made it unsettable at the only moment anyone is there to set it.
+     * out_modbus_start() looks for the station interface and declines
+     * cleanly when it is absent, which is where that check belongs. */
     } else if (want_bip) {
         /* Stored and validated so the datalink needs no second settings
          * pass, but out_bacnet compiles BACDL_MSTP only, so enabling it

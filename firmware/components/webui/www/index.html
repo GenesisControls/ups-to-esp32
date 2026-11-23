@@ -2295,13 +2295,26 @@ function busUI(b){
     $('bus-rs485').value=String(b.rs485||1);
     $('bus-tcp-en').checked=!!b.tcp_en;
     $('bus-bip-en').checked=!!b.bip_en;
-    // BACnet/IP has no datalink in this firmware, so it cannot be switched
-    // on -- disabled rather than hidden, so the plan stays visible.
+    // TWO DIFFERENT KINDS OF "not now", and only one of them is a reason to
+    // refuse the setting.
+    //
+    // Modbus TCP works; it is waiting for a network, which is a RUNTIME
+    // condition that can change after this page is closed. It must therefore
+    // be settable with no network present -- a technician configures this
+    // board from its own access point, before it has joined anything, and
+    // gating the switch on a joined network made it dead at exactly the
+    // moment someone is standing in front of it. out_modbus_start() checks
+    // for the station interface itself and declines cleanly without one.
+    //
+    // BACnet/IP is a BUILD condition: no BIP datalink is compiled, so it can
+    // never start in this firmware however the network looks. That one stays
+    // disabled, and says why.
     $('bus-bip-en').disabled=true;
-    $('bus-tcp-en').disabled=!b.ip;
+    $('bus-tcp-en').disabled=false;
     $('bus-ip-note').textContent = b.ip
       ? 'BACnet/IP is not in this firmware yet.'
-      : 'These appear once this board has joined a network. BACnet/IP is not in this firmware yet.';
+      : 'Modbus TCP can be set now and starts once this board joins a network. '
+        +'BACnet/IP is not in this firmware yet.';
     $('bus-addr').value=b.address||4;
     $('bus-baud').value=String(b.baud===undefined?0:b.baud);
     $('bus-fmt').value=String(b.format||1);
@@ -2331,7 +2344,10 @@ function busUI(b){
   const live=[];
   if(t===2) live.push(['Modbus RTU', rtu, `at ${rtu.baud||b.baud||'auto'} baud ${fmts[b.format||1]}`]);
   if(t===3) live.push(['BACnet MS/TP', mstp, `at ${mstp.baud||b.baud||'auto'} baud 8N1`]);
-  if(b.tcp_en) live.push(['Modbus TCP', tcp, `on port ${tcp.port||b.mbport||502}`]);
+  // The fourth element says why an output is not running when "restart to
+  // apply" would be a lie -- a restart does not conjure a network.
+  if(b.tcp_en) live.push(['Modbus TCP', tcp, `on port ${tcp.port||b.mbport||502}`,
+                          b.ip?null:'on, and starts once this board joins a network.']);
 
   $('bus-sum').textContent = live.length
     ? live.map(([name])=>name).join(' + ') + ` · address ${b.address}`
@@ -2341,14 +2357,14 @@ function busUI(b){
   if(!live.length){
     st='Nothing is being served. Choose a trunk protocol or switch on Modbus TCP, then restart.';
   } else {
-    st=live.map(([name,s,how])=>{
-      if(!s.running) return `${name}: selected but not running — restart to apply.`;
+    st=live.map(([name,s,how,blocked])=>{
+      if(!s.running) return `${name}: ${blocked||'selected but not running — restart to apply.'}`;
       if(s.quiet_s<0) return `${name}: up ${how}, nothing has polled it yet.`;
       return `${name}: ${how} · ${plural(s.requests||0,'request')} · last ${s.quiet_s}s ago`
              + (s.writes?` · ${plural(s.writes,'write')} refused`:'');
     }).join('<br>');
   }
-  if(!b.ip) st+='<br>Modbus TCP and BACnet/IP appear once this board has joined a network.';
+  if(!b.ip) st+='<br>This board has not joined a network, so nothing it serves over one is running.';
 
   // Communication, for commissioning. One table per running output, because a
   // single table cannot say which transport the counts belong to -- and that
