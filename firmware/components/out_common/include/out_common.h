@@ -75,7 +75,12 @@ enum {                          /* input registers (FC4), mirrored as holding */
     /* 19-23 reserved for further adapter facts */
 };
 
-/* WHICH PROTOCOL IS ON THE BUS. Exactly one, ever.
+/* THE PROTOCOLS THIS FIRMWARE KNOWS BY NAME.
+ *
+ * Not "one, ever" -- that was true until 2026-11-22 and is not now. The RS485
+ * protocol is one of RTU or MS/TP, and Modbus TCP runs alongside either.
+ * OUT_PROTO_BACNET_IP is a name only: nothing serves it and
+ * out_common_set_proto() refuses it.
  *
  * Kept here rather than in either output so both read the same answer and
  * neither can start while the other holds the trunk. Each output is started
