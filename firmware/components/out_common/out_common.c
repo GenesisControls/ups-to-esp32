@@ -58,9 +58,8 @@ static uint16_t          s_boots;
 static int               s_bat_life_years = 5;
 static char              s_bat_date[11];    /* "YYYY-MM-DD", "" for unset */
 static out_hb_policy_t   s_hb = OUT_HB_INVALID;
-static out_proto_t       s_rs485 = OUT_PROTO_NONE;   /* trunk: one of three */
-static bool              s_tcp_en;                  /* Modbus TCP */
-static bool              s_bip_en;                  /* BACnet/IP */
+static out_proto_t       s_proto = OUT_PROTO_NONE;   /* one of RTU/MSTP/BIP */
+static bool              s_tcp_en;                  /* Modbus TCP, alongside */
 static int               s_addr = OUT_ADDR_DEFAULT;
 static int               s_baud = OUT_BAUD_AUTO;
 static out_fmt_t         s_fmt = OUT_FMT_8N1;
@@ -282,26 +281,28 @@ static void load_settings(void)
     if (nvs_get_i8(h, KEY_BAT_LIFE, &life) == ESP_OK) s_bat_life_years = life;
     uint8_t hb = 0;
     if (nvs_get_u8(h, KEY_HB, &hb) == ESP_OK) s_hb = hb ? OUT_HB_RUN : OUT_HB_INVALID;
-    /* KEY_PROTO used to hold ONE protocol for the whole device. A board
-     * configured before the split can have 4 (Modbus TCP) or 5 (BACnet/IP)
-     * stored there, which is no longer a legal trunk value -- so migrate it
-     * into the matching toggle instead of discarding the site's setting or
-     * leaving an illegal value in s_rs485. The new keys, if present, win. */
+    /* KEY_PROTO holds the primary protocol. Two generations of stored value
+     * have to survive here:
+     *
+     *   - Before 2026-11-22 it held ONE protocol for the whole device, so it
+     *     can contain 4 (Modbus TCP), which is not a primary protocol now and
+     *     becomes the TCP toggle instead.
+     *   - Briefly after that it was a trunk-only value with BACnet/IP living
+     *     in KEY_BIPEN. That key is folded back in below.
+     *
+     * Discarding either would silently unconfigure a commissioned board. */
     uint8_t pr = 0;
     if (nvs_get_u8(h, KEY_PROTO, &pr) == ESP_OK) {
         switch (pr) {
         case OUT_PROTO_NONE:
         case OUT_PROTO_MODBUS_RTU:
         case OUT_PROTO_BACNET_MSTP:
-            s_rs485 = (out_proto_t)pr;
+        case OUT_PROTO_BACNET_IP:
+            s_proto = (out_proto_t)pr;
             break;
         case OUT_PROTO_MODBUS_TCP:
-            s_rs485 = OUT_PROTO_NONE;
+            s_proto = OUT_PROTO_NONE;
             s_tcp_en = true;
-            break;
-        case OUT_PROTO_BACNET_IP:
-            s_rs485 = OUT_PROTO_NONE;
-            s_bip_en = true;
             break;
         default:
             break;                  /* corrupt: keep the default */
@@ -309,8 +310,13 @@ static void load_settings(void)
     }
     uint8_t te = 0;
     if (nvs_get_u8(h, KEY_TCPEN, &te) == ESP_OK) s_tcp_en = te != 0;
+    /* The short-lived separate BACnet/IP toggle, folded into the selector.
+     * It could never be set to true through the page (post_bus refused it),
+     * so this is for completeness rather than a case anyone has hit. */
     uint8_t be = 0;
-    if (nvs_get_u8(h, KEY_BIPEN, &be) == ESP_OK) s_bip_en = be != 0;
+    if (nvs_get_u8(h, KEY_BIPEN, &be) == ESP_OK && be) {
+        s_proto = OUT_PROTO_BACNET_IP;
+    }
     uint8_t ad = 0;
     if (nvs_get_u8(h, KEY_ADDR, &ad) == ESP_OK && ad >= 1 && ad <= 127) s_addr = ad;
     int32_t bd = 0;
@@ -346,20 +352,20 @@ static esp_err_t put_u8(const char *key, uint8_t v)
     return e;
 }
 
-out_proto_t out_common_rs485(void) { return s_rs485; }
+out_proto_t out_common_proto(void) { return s_proto; }
 
-esp_err_t out_common_set_rs485(out_proto_t p)
+esp_err_t out_common_set_proto(out_proto_t p)
 {
-    /* The trunk carries one of three. The IP protocols are their own
-     * switches now, so passing one here is a caller using the old shape and
-     * is refused rather than quietly stored as a trunk setting. */
+    /* One of the three primary protocols, or nothing. Modbus TCP is not a
+     * value here -- it is its own switch, because it runs alongside these
+     * rather than instead of them. */
     if (p != OUT_PROTO_NONE && p != OUT_PROTO_MODBUS_RTU &&
-        p != OUT_PROTO_BACNET_MSTP) {
+        p != OUT_PROTO_BACNET_MSTP && p != OUT_PROTO_BACNET_IP) {
         return ESP_ERR_INVALID_ARG;
     }
     esp_err_t e = put_u8(KEY_PROTO, (uint8_t)p);
     if (e == ESP_OK) {
-        s_rs485 = p;
+        s_proto = p;
         /* Deliberately not started or stopped here. An output that is holding
          * a UART or a socket cannot be swapped under a live trunk safely, and
          * a BMS seeing a device vanish mid-poll logs a fault. The page asks
@@ -411,7 +417,7 @@ esp_err_t out_common_set_address(int addr)
      * its unit id, and its 1-247 range is the wider of the two, so a value
      * legal for the trunk is always legal for TCP as well -- which is what
      * lets one stored number serve both at once. */
-    if (!out_common_address_valid(addr, s_rs485)) return ESP_ERR_INVALID_ARG;
+    if (!out_common_address_valid(addr, s_proto)) return ESP_ERR_INVALID_ARG;
     esp_err_t e = put_u8(KEY_ADDR, (uint8_t)addr);
     if (e == ESP_OK) s_addr = addr;
     return e;
@@ -470,9 +476,8 @@ esp_err_t out_common_init(void)
              s_hb == OUT_HB_RUN ? "keeps counting" : "reads 65535");
     /* All three outputs, because all three can be on. A log line naming only
      * one of them is how "but it IS configured" arguments start. */
-    ESP_LOGI(TAG, "bus: trunk %s, Modbus TCP %s, BACnet/IP %s; address %d, baud %s, %s",
-             out_common_proto_name(s_rs485),
-             s_tcp_en ? "on" : "off", s_bip_en ? "on" : "off",
+    ESP_LOGI(TAG, "bus: %s, Modbus TCP %s; address %d, baud %s, %s",
+             out_common_proto_name(s_proto), s_tcp_en ? "on" : "off",
              s_addr, s_baud == OUT_BAUD_AUTO ? "auto" : "fixed",
              out_common_format_name(s_fmt));
     return ESP_OK;
@@ -621,15 +626,6 @@ esp_err_t out_common_set_tcp_enabled(bool on)
 {
     esp_err_t e = put_u8(KEY_TCPEN, on ? 1 : 0);
     if (e == ESP_OK) s_tcp_en = on;
-    return e;
-}
-
-bool out_common_bip_enabled(void) { return s_bip_en; }
-
-esp_err_t out_common_set_bip_enabled(bool on)
-{
-    esp_err_t e = put_u8(KEY_BIPEN, on ? 1 : 0);
-    if (e == ESP_OK) s_bip_en = on;
     return e;
 }
 

@@ -395,15 +395,14 @@ static esp_err_t get_status(httpd_req_t *req)
         #define QUIET(us) ((us) ? (long long)((now - (us)) / 1000000) : -1LL)
 
         n += snprintf(AT(n), ROOM(n),
-                  ",\"bus\":{\"rs485\":%d,\"tcp_en\":%s,\"bip_en\":%s,"
+                  ",\"bus\":{\"proto\":%d,\"tcp_en\":%s,"
                   "\"has485\":%s,\"ip\":%s,"
                   "\"address\":%d,\"baud\":%d,\"format\":%d,\"cmd\":%s,"
                   "\"devid\":%lu,\"devid_set\":%lu,\"devname\":\"%s\","
                   "\"infofr\":%d,\"maxmast\":%d,\"bacnet_net\":%d,"
                   "\"mbport\":%d,\"bipport\":%d",
-                  (int)out_common_rs485(),
+                  (int)out_common_proto(),
                   out_common_tcp_enabled() ? "true" : "false",
-                  out_common_bip_enabled() ? "true" : "false",
                   BOARD_HAS_RS485 ? "true" : "false",
                   netmgr_state() == NETMGR_STA_CONNECTED ? "true" : "false",
                   out_common_address(), out_common_baud(),
@@ -1402,65 +1401,57 @@ static esp_err_t post_bus(httpd_req_t *req)
      * when the second is refused. Switching to MS/TP with address 200 stored
      * is the case that matters: refuse it and say why, rather than clamp to
      * something the BMS is not polling. */
-    /* THE TRUNK and THE TWO TOGGLES. rs485 is one-of-three; tcp_en and
-     * bip_en are independent of it and of each other. */
-    const int want_rs485 = BUS_INT(root, "rs485", (int)out_common_rs485());
+    /* ONE PRIMARY PROTOCOL, plus an independent Modbus TCP switch.
+     *
+     * The three primaries are mutually exclusive for two different reasons
+     * -- RTU and MS/TP share the UART, MS/TP and BACnet/IP share
+     * bacnet-stack's single Datalink_Transport -- and are therefore one
+     * field. Modbus TCP shares nothing with them but the point set, so it is
+     * a switch rather than a fourth option. */
+    const int want_proto = BUS_INT(root, "proto", (int)out_common_proto());
     const int want_addr  = BUS_INT(root, "address", out_common_address());
     const cJSON *jtcp = cJSON_GetObjectItemCaseSensitive(root, "tcp_en");
-    const cJSON *jbip = cJSON_GetObjectItemCaseSensitive(root, "bip_en");
     const bool want_tcp = cJSON_IsBool(jtcp) ? cJSON_IsTrue(jtcp)
                                              : out_common_tcp_enabled();
-    const bool want_bip = cJSON_IsBool(jbip) ? cJSON_IsTrue(jbip)
-                                             : out_common_bip_enabled();
 
-    if (want_rs485 != OUT_PROTO_NONE &&
-        want_rs485 != OUT_PROTO_MODBUS_RTU &&
-        want_rs485 != OUT_PROTO_BACNET_MSTP) {
-        /* The IP protocols are no longer values this field can hold: they are
-         * their own switches. A caller sending the old single "proto" would
-         * land here, which is the right answer -- the shape changed. */
-        why = "the RS485 trunk carries Modbus RTU or BACnet MS/TP, or nothing";
-    } else if (want_rs485 != OUT_PROTO_NONE && !BOARD_HAS_RS485) {
-        why = "this board has no RS485 transceiver";
-    /* Modbus TCP is deliberately NOT gated on a joined network here. It is a
-     * stored intention, and the network is a runtime condition that changes
-     * after this request is over: a technician sets this up from the board's
-     * own access point, before it has joined anything. Refusing the setting
-     * made it unsettable at the only moment anyone is there to set it.
-     * out_modbus_start() looks for the station interface and declines
-     * cleanly when it is absent, which is where that check belongs. */
-    } else if (want_bip) {
-        /* Stored and validated so the datalink needs no second settings
-         * pass, but out_bacnet compiles BACDL_MSTP only, so enabling it
-         * would serve nothing. */
+    if (want_proto != OUT_PROTO_NONE && want_proto != OUT_PROTO_MODBUS_RTU &&
+        want_proto != OUT_PROTO_BACNET_MSTP && want_proto != OUT_PROTO_BACNET_IP) {
+        /* Modbus TCP is not a value here: a caller sending 4 is using the
+         * old shape, where this field held every protocol. */
+        why = "the protocol must be Modbus RTU, BACnet MS/TP, BACnet/IP or none";
+    } else if (want_proto == OUT_PROTO_BACNET_IP) {
+        /* In the selector, served by nothing: out_bacnet compiles BACDL_MSTP
+         * only. Its settings are stored and validated so the datalink needs
+         * no second settings pass, but selecting it would leave the board
+         * silent while the page named a protocol. */
         why = "BACnet/IP is not in this firmware yet";
-    } else if (!out_common_address_valid(want_addr, (out_proto_t)want_rs485)) {
-        /* Judged against the TRUNK, whose range is the narrower of the two
-         * when MS/TP is selected. Modbus TCP shares the number and allows
-         * 1-247, so anything legal for the trunk is legal for TCP too. */
-        why = (want_rs485 == OUT_PROTO_BACNET_MSTP)
+    } else if ((want_proto == OUT_PROTO_MODBUS_RTU ||
+                want_proto == OUT_PROTO_BACNET_MSTP) && !BOARD_HAS_RS485) {
+        why = "this board has no RS485 transceiver";
+    } else if (!out_common_address_valid(want_addr, (out_proto_t)want_proto)) {
+        /* Judged against the primary protocol, whose range is the narrower of
+         * the two when MS/TP is selected. Modbus TCP shares the number and
+         * allows 1-247, so anything legal for the primary is legal for TCP. */
+        why = (want_proto == OUT_PROTO_BACNET_MSTP)
                   ? "a BACnet MS/TP MAC must be 0-127"
                   : "a Modbus address must be 1-247";
     }
 
-    /* ORDER MATTERS: the trunk protocol goes in FIRST.
+    /* ORDER MATTERS: the protocol goes in FIRST.
      *
-     * out_common_set_address() validates against the trunk setting in force,
-     * so writing the address first lets the OLD protocol judge the NEW
-     * address -- changing MS/TP (MAC 100) to Modbus RTU (address 200) would
-     * pass the pair check above and then be refused by the setter, because
-     * MS/TP's 0-127 limit still applied at that moment. */
-    if (!why && out_common_set_rs485((out_proto_t)want_rs485) != ESP_OK) {
-        why = "could not save the trunk protocol";
+     * out_common_set_address() validates against the protocol in force, so
+     * writing the address first lets the OLD protocol judge the NEW address
+     * -- changing MS/TP (MAC 100) to Modbus RTU (address 200) would pass the
+     * pair check above and then be refused by the setter, because MS/TP's
+     * 0-127 limit still applied at that moment. */
+    if (!why && out_common_set_proto((out_proto_t)want_proto) != ESP_OK) {
+        why = "could not save the protocol";
     }
     if (!why && out_common_set_address(want_addr) != ESP_OK) {
         why = "could not save the address";
     }
     if (!why && out_common_set_tcp_enabled(want_tcp) != ESP_OK) {
         why = "could not save the Modbus TCP setting";
-    }
-    if (!why && out_common_set_bip_enabled(want_bip) != ESP_OK) {
-        why = "could not save the BACnet/IP setting";
     }
 
     BUS_SET(root, "baud", out_common_set_baud(jj->valueint),

@@ -463,7 +463,7 @@ esp_err_t out_modbus_start(void)
      *
      * The address is shared: it is the RTU station address and the TCP unit
      * id, one number because a site thinks of it as one. */
-    const bool want_rtu = (out_common_rs485() == OUT_PROTO_MODBUS_RTU);
+    const bool want_rtu = (out_common_proto() == OUT_PROTO_MODBUS_RTU);
     const bool want_tcp = out_common_tcp_enabled();
     if (!want_rtu && !want_tcp) {
         return ESP_OK;                      /* not ours: cost the board nothing */

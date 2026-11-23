@@ -99,38 +99,39 @@ typedef enum {
     OUT_PROTO_BACNET_IP,        /* needs an IP address */
 } out_proto_t;
 
-/* WHAT RUNS, and it is not one choice but three.
+/* WHAT RUNS: one primary protocol, plus Modbus TCP if wanted.
  *
- * The RS485 trunk carries ONE protocol, because it is one UART and one pair
- * of wires: Modbus RTU or BACnet MS/TP, never both. The IP protocols are
- * independent of that and of each other -- a board can serve BACnet MS/TP on
- * the trunk while answering Modbus TCP over Wi-Fi, and that is a real site
- * configuration rather than a hypothetical.
+ * The primary protocol is one of Modbus RTU, BACnet MS/TP or BACnet/IP, and
+ * they are mutually exclusive for two different reasons:
  *
- * Collapsing this into a single enum (which it was until 2026-11-22) made the
- * settings lie about what the hardware can do. Three outputs can run at once
- * and out_common was always built for that: one shared point set, so no two
- * of them can answer differently in the same second.
+ *   - RTU and MS/TP share the RS485 UART. One pair of wires, one protocol.
+ *   - MS/TP and BACnet/IP share bacnet-stack's single Datalink_Transport.
+ *     BACDL_MULTIPLE compiles several datalinks in but datalink_receive() is
+ *     a switch over one active transport, so the stack serves ONE at a time.
+ *     Serving both would mean the router/gateway pattern, which is a
+ *     different device.
  *
- * out_common_rs485() returns OUT_PROTO_NONE, OUT_PROTO_MODBUS_RTU or
- * OUT_PROTO_BACNET_MSTP only. The IP members of out_proto_t stay in the enum
- * for naming, not as a value this can hold. */
-out_proto_t out_common_rs485(void);
-esp_err_t   out_common_set_rs485(out_proto_t p);
+ * Strictly, Modbus RTU and BACnet/IP do not conflict with each other at all
+ * -- different stacks, different media. One selector is a little stricter
+ * than physics requires, and that is deliberate: Tobias chose it on
+ * 2026-11-22 over a conflict matrix nobody wants to explain to a technician,
+ * and a site with BACnet/IP is not also asking for Modbus on the trunk.
+ *
+ * Modbus TCP is the exception that genuinely is independent: it shares
+ * nothing with the three above except the point set, so it runs alongside any
+ * of them. That is what the esp-modbus 2.x migration was for -- 1.x kept one
+ * global slave instance, so an RTU slave and a TCP slave could not coexist
+ * however the settings were shaped.
+ *
+ * out_common was always built for several outputs at once: one shared point
+ * set, so no two of them can answer differently in the same second. */
+out_proto_t out_common_proto(void);
+esp_err_t   out_common_set_proto(out_proto_t p);
 const char *out_common_proto_name(out_proto_t p);
 
-/* Modbus TCP, independent of the trunk. Needs esp-modbus 2.x, which is why
- * that migration came first: 1.x kept one global slave instance, so an RTU
- * slave and a TCP slave could not coexist however the settings were shaped. */
+/* Modbus TCP, alongside whatever the primary protocol is. */
 bool      out_common_tcp_enabled(void);
 esp_err_t out_common_set_tcp_enabled(bool on);
-
-/* BACnet/IP, independent of everything else. Stored and validated, but the
- * BIP datalink is not compiled yet (out_bacnet builds BACDL_MSTP only), so
- * enabling it currently serves nothing -- the page and post_bus both refuse
- * it rather than letting someone select silence. */
-bool      out_common_bip_enabled(void);
-esp_err_t out_common_set_bip_enabled(bool on);
 
 /* The station address. One stored number for all four protocols, because a
  * site thinks of it as one thing -- "which device is this" -- even though each
