@@ -636,11 +636,26 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
       <p class="note">What this adapter puts the UPS on, for a building management system.
         One protocol at a time &mdash; the trunk cannot carry two. The UPS data is read-only on
         the bus: this device never accepts commands from it. Changes need a restart.</p>
-      <label for="bus-proto">Protocol</label>
-      <select id="bus-proto"></select>
-      <p class="note">Modbus RTU, Modbus TCP and BACnet MS/TP work. BACnet/IP stays greyed out:
-        its datalink is not compiled into this firmware. Only the settings the chosen protocol
-        actually uses are shown.</p>
+      <div id="f-trunk">
+        <label for="bus-rs485">RS485 trunk</label>
+        <select id="bus-rs485">
+          <option value="1">nothing</option>
+          <option value="2">Modbus RTU</option>
+          <option value="3">BACnet MS/TP</option>
+        </select>
+        <p class="note">One protocol at a time here &mdash; it is one pair of wires.</p>
+      </div>
+
+      <div id="f-ipouts">
+        <div class="k" style="margin-top:14px">Over the network</div>
+        <label class="chk"><input type="checkbox" id="bus-tcp-en"> Modbus TCP</label>
+        <label class="chk"><input type="checkbox" id="bus-bip-en"> BACnet/IP</label>
+        <p class="note" id="bus-ip-note"></p>
+      </div>
+
+      <p class="note">These are independent: this adapter can serve BACnet MS/TP on the trunk
+        and answer Modbus TCP over the network at the same time. Only the settings the chosen
+        outputs actually use are shown below.</p>
 
       <div id="f-addr">
         <label for="bus-addr"><span id="bus-addr-label">Address</span> <span class="note" id="bus-addr-hint"></span></label>
@@ -2237,44 +2252,56 @@ if($('fwup-go')) $('fwup-go').onclick=async()=>{
 // logs "not implemented yet" for TCP, so offering the other three would let
 // someone pick one and get silence on the trunk while this page named a
 // protocol. They come back here as each one starts working.
-// Which settings each protocol actually uses. Showing the rest would invite
-// someone to set a parity for MS/TP (fixed at 8N1 by ANSI/ASHRAE 135) or a
-// baud rate for Modbus TCP, then wonder why it changed nothing.
+// Which settings the CHOSEN OUTPUTS use, as a union -- up to three run at
+// once, so this is no longer a lookup by one protocol. Showing the rest would
+// invite someone to set a parity for MS/TP (fixed at 8N1 by ANSI/ASHRAE 135)
+// or a baud rate for a protocol that runs on a socket.
 //
-// Driven by the DROPDOWN, not by the saved protocol, so the fields follow the
+// Driven by the live controls, not the saved settings, so the fields follow a
 // choice immediately rather than after a save and a restart.
-const BUS_FIELDS={
-  1:[],                                                  // none
-  2:['f-addr','f-baud','f-fmt','f-cmd'],                 // Modbus RTU
-  3:['f-addr','f-devid','f-baud','f-mstp'],              // BACnet MS/TP
-  4:['f-addr','f-mbport','f-cmd'],                       // Modbus TCP
-  5:['f-devid','f-bnet','f-bipport'],                    // BACnet/IP
-};
 const BUS_GROUPS=['f-addr','f-devid','f-fmt','f-baud','f-mstp','f-bnet','f-mbport','f-bipport','f-cmd'];
-function busFields(p){
-  const on=BUS_FIELDS[p]||[];
-  for(const g of BUS_GROUPS){ const el=$(g); if(el) el.hidden=!on.includes(g); }
-  // The same stored number, named as each transport names it.
-  const mstp=p===3;
-  $('bus-addr-label').textContent=(p===4)?'Unit ID':'MAC address';
-  $('bus-addr-hint').textContent=mstp?'(MS/TP station address, 0 to 127)'
-                                     :'(1 to 247)';
+function busFields(){
+  const t=+$('bus-rs485').value||1, tcp=$('bus-tcp-en').checked, bip=$('bus-bip-en').checked;
+  const rtu=t===2, mstp=t===3;
+  const on={
+    'f-addr'   : rtu||mstp||tcp,   // the station address, shared
+    'f-baud'   : rtu||mstp,        // serial only
+    'f-fmt'    : rtu,              // MS/TP is 8N1 by standard
+    'f-mstp'   : mstp,             // token passing
+    'f-devid'  : mstp||bip,        // BACnet identity
+    'f-bnet'   : bip,
+    'f-mbport' : tcp,
+    'f-bipport': bip,
+    'f-cmd'    : rtu||tcp,         // coil 100 is Modbus; BACnet has no equivalent
+  };
+  for(const g of BUS_GROUPS){ const el=$(g); if(el) el.hidden=!on[g]; }
+
+  // The same stored number, named as each transport names it. With a trunk
+  // protocol AND Modbus TCP on, one number is both, so say so rather than
+  // picking one name and leaving the other unexplained.
+  $('bus-addr-label').textContent = (rtu||mstp) ? 'MAC address' : 'Unit ID';
+  $('bus-addr-hint').textContent =
+    mstp ? (tcp?'(MS/TP station address 0-127; also the Modbus TCP unit id)'
+               :'(MS/TP station address, 0 to 127)')
+         : (rtu&&tcp?'(RS485 station address, and the Modbus TCP unit id)':'(1 to 247)');
 }
 let busBuilt=null;
 function busUI(b){
-  const key=JSON.stringify([b.rs485,b.ip,b.proto,b.address,b.baud,b.format,b.cmd,
+  const key=JSON.stringify([b.has485,b.ip,b.rs485,b.tcp_en,b.bip_en,b.address,b.baud,b.format,b.cmd,
                             b.devid_set,b.infofr,b.maxmast,b.bacnet_net,b.mbport,b.bipport]);
   if(busBuilt!==key){
     busBuilt=key;
-    const opts=[[1,'none (nothing on the bus)']];
-    // The matrix: the RS485 pair always, the IP pair once the board has
-    // joined a network. A third element marks a protocol nothing serves yet
-    // -- offered as a disabled row, so the list shows the whole plan without
-    // letting anyone select silence.
-    if(b.rs485){ opts.push([2,'Modbus RTU (RS485)']); opts.push([3,'BACnet MS/TP (RS485)']); }
-    if(b.ip){ opts.push([4,'Modbus TCP']); opts.push([5,'BACnet/IP',1]); }
-    $('bus-proto').innerHTML=opts.map(o=>`<option value="${o[0]}"${o[2]?' disabled':''}>${esc(o[1])}${o[2]?' \u2014 not in this firmware yet':''}</option>`).join('');
-    $('bus-proto').value=String(b.proto||1);
+    $('f-trunk').hidden=!b.has485;
+    $('bus-rs485').value=String(b.rs485||1);
+    $('bus-tcp-en').checked=!!b.tcp_en;
+    $('bus-bip-en').checked=!!b.bip_en;
+    // BACnet/IP has no datalink in this firmware, so it cannot be switched
+    // on -- disabled rather than hidden, so the plan stays visible.
+    $('bus-bip-en').disabled=true;
+    $('bus-tcp-en').disabled=!b.ip;
+    $('bus-ip-note').textContent = b.ip
+      ? 'BACnet/IP is not in this firmware yet.'
+      : 'These appear once this board has joined a network. BACnet/IP is not in this firmware yet.';
     $('bus-addr').value=b.address||4;
     $('bus-baud').value=String(b.baud===undefined?0:b.baud);
     $('bus-fmt').value=String(b.format||1);
@@ -2285,58 +2312,93 @@ function busUI(b){
     $('bus-bnet').value=String(b.bacnet_net||0);
     $('bus-mbport').value=String(b.mbport||502);
     $('bus-bipport').value=String(b.bipport||47808);
-    busFields(+$('bus-proto').value||1);
+    busFields();
   }
   // What the device is actually using, which differs from the field whenever
   // the field says 0.
   $('bus-devid-now').textContent =
     (b.devid_set===0 && b.devid) ? `In use now: ${b.devid}, derived from the MAC.` : '';
-  // Index 0 is unused: the C enums start at 1 so a zero can never be
-  // mistaken for a real choice that simply was not sent.
-  const names=['','none','Modbus RTU','BACnet MS/TP','Modbus TCP','BACnet/IP'];
   const fmts=['','8N1','8E1','8O1','8N2'];
+  const TRUNK=['','nothing','Modbus RTU','BACnet MS/TP'];
+  const plural=(n,w)=>`${n} ${w}${n===1?'':'s'}`;
 
-  $('bus-sum').textContent = (b.proto>1) ? `${names[b.proto]} · address ${b.address}` : 'nothing selected';
-  // An IP protocol has no baud rate and no data format, so the wire details
-  // the serial line prints would be meaningless; it gets its port instead.
-  // MS/TP is 8N1 by standard, whatever the Modbus data-format setting happens
-  // to hold, so it must not print a stored parity it does not use.
-  const onIp=b.proto===4||b.proto===5, mstp=b.proto===3;
-  // The port is configurable, so it must be read rather than written into the
-  // sentence -- a hardcoded 502 becomes a lie the moment anyone changes it.
-  const port=b.proto===5?(b.bipport||47808):(b.mbport||502);
+  // UP TO THREE OUTPUTS, each with its own state, so the summary is a list
+  // rather than a sentence. A board can be serving BACnet MS/TP on the trunk
+  // and Modbus TCP over Wi-Fi, and saying "BACnet MS/TP - address 4" would
+  // describe half of what it is doing.
+  const rtu=b.rtu||{}, tcp=b.tcp||{}, mstp=b.mstp||{};
+  const t=b.rs485||1;
+  const live=[];
+  if(t===2) live.push(['Modbus RTU', rtu, `at ${rtu.baud||b.baud||'auto'} baud ${fmts[b.format||1]}`]);
+  if(t===3) live.push(['BACnet MS/TP', mstp, `at ${mstp.baud||b.baud||'auto'} baud 8N1`]);
+  if(b.tcp_en) live.push(['Modbus TCP', tcp, `on port ${tcp.port||b.mbport||502}`]);
+
+  $('bus-sum').textContent = live.length
+    ? live.map(([name])=>name).join(' + ') + ` · address ${b.address}`
+    : 'nothing selected';
+
   let st;
-  if(!b.proto||b.proto===1) st='Nothing is being served. Pick a protocol and restart.';
-  else if(!b.running) st=`${names[b.proto]} is selected but not running — restart to apply.`;
-  else if(b.quiet_s<0) st=onIp?`Listening on port ${port}. Nothing has connected yet.`
-                             :`Running at ${b.baud||'auto'} baud. Nothing has polled this device yet.`;
-  else st=`Running ${onIp?`on port ${port}`:`at ${b.baud} baud ${mstp?'8N1':fmts[b.format||1]}`} · ${b.requests} request${b.requests===1?'':'s'} · last ${b.quiet_s}s ago`
-         + (b.writes?` · ${b.writes} write${b.writes===1?'':'s'} refused`:'');
-  if(!b.ip) st+=' Modbus TCP and BACnet/IP appear once this board has joined a network.';
+  if(!live.length){
+    st='Nothing is being served. Choose a trunk protocol or switch on Modbus TCP, then restart.';
+  } else {
+    st=live.map(([name,s,how])=>{
+      if(!s.running) return `${name}: selected but not running — restart to apply.`;
+      if(s.quiet_s<0) return `${name}: up ${how}, nothing has polled it yet.`;
+      return `${name}: ${how} · ${plural(s.requests||0,'request')} · last ${s.quiet_s}s ago`
+             + (s.writes?` · ${plural(s.writes,'write')} refused`:'');
+    }).join('<br>');
+  }
+  if(!b.ip) st+='<br>Modbus TCP and BACnet/IP appear once this board has joined a network.';
 
-
-  // Communication, for commissioning. Everything here is measured; see
-  // out_modbus.h for why there is no CRC/framing error count -- esp-modbus
-  // drops bad frames inside the stack, and a counter stuck at zero would
-  // read as "healthy" when it means "not counted".
-  const rd=b.rd||[0,0,0,0];
-  $('bus-comms').innerHTML = !b.running ? '' :
-    `<table class="tbl">
-       <tr><th colspan="2">Communication</th></tr>
-       <tr><td>Requests</td><td>${b.requests||0} total · ${b.per_min||0} in the last minute</td></tr>
-       <tr><td>Last request</td><td>${b.quiet_s<0?'never':b.quiet_s+' s ago'}</td></tr>
-       <tr><td>Input regs (FC4)</td><td>${rd[0]}</td></tr>
+  // Communication, for commissioning. One table per running output, because a
+  // single table cannot say which transport the counts belong to -- and that
+  // is exactly the question when one of two outputs is silent.
+  //
+  // Everything here is measured; see out_modbus.h for why there is no
+  // CRC/framing error count -- esp-modbus drops bad frames inside the stack,
+  // and a counter stuck at zero would read as "healthy" when it means "not
+  // counted".
+  const rows=(name,s,extra)=>{
+    const rd=s.rd||[0,0,0,0];
+    return `<table class="tbl">
+       <tr><th colspan="2">${esc(name)}</th></tr>
+       <tr><td>Requests</td><td>${s.requests||0} total · ${s.per_min||0} in the last minute</td></tr>
+       <tr><td>Last request</td><td>${s.quiet_s<0?'never':s.quiet_s+' s ago'}</td></tr>
+       ${extra}
+     </table>`;
+  };
+  const mbRows=s=>{
+    const rd=s.rd||[0,0,0,0];
+    return `<tr><td>Input regs (FC4)</td><td>${rd[0]}</td></tr>
        <tr><td>Holding regs (FC3)</td><td>${rd[1]}</td></tr>
        <tr><td>Discretes (FC2)</td><td>${rd[2]}</td></tr>
        <tr><td>Coils (FC1)</td><td>${rd[3]}</td></tr>
-       <tr><td>Bus collisions</td><td>${b.collisions||0}${b.collisions?' — check for a duplicate address on the trunk':''}</td></tr>
-       <tr><td>Writes refused</td><td>${b.writes||0}</td></tr>
-       <tr><td>Self-tests started</td><td>${b.tests||0}</td></tr>
-     </table>
-     <p class="note">Counters are since the last restart, not stored. Silence while the trunk's
-       other devices work usually means the baud or data format is wrong; collisions usually mean
-       two devices share an address.</p>`;
-  $('bus-stat').textContent=st;
+       <tr><td>Writes refused</td><td>${s.writes||0}</td></tr>
+       <tr><td>Self-tests started</td><td>${s.tests||0}</td></tr>`;
+  };
+  let comms='';
+  if(t===2 && rtu.running){
+    comms+=rows('Modbus RTU (RS485)', rtu, mbRows(rtu)
+      +`<tr><td>Bus collisions</td><td>${rtu.collisions||0}${rtu.collisions?' — check for a duplicate address on the trunk':''}</td></tr>`);
+  }
+  if(t===3 && mstp.running){
+    comms+=rows('BACnet MS/TP (RS485)', mstp,
+      `<tr><td>Device instance</td><td>${b.devid||0}${b.devid_set===0?' (derived from the MAC)':''}</td></tr>
+       <tr><td>Station MAC</td><td>${mstp.mac||0}</td></tr>
+       <tr><td>Bytes</td><td>${mstp.bytes_tx||0} sent · ${mstp.bytes_rx||0} received</td></tr>`);
+  }
+  if(b.tcp_en && tcp.running){
+    comms+=rows(`Modbus TCP (port ${tcp.port||b.mbport||502})`, tcp, mbRows(tcp));
+  }
+  $('bus-comms').innerHTML = comms &&
+    comms+`<p class="note">Counters are since the last restart, not stored. Silence on the trunk
+       while its other devices work usually means the baud or data format is wrong; collisions
+       usually mean two devices share an address.</p>`;
+  // innerHTML, not textContent: one line per output, which with three of them
+  // is the difference between a list and a run-on sentence. Every part of st
+  // is built here from numbers and fixed strings -- nothing from the UPS or
+  // the network reaches it -- so there is nothing to escape.
+  $('bus-stat').innerHTML=st;
 }
 // Restart, next to the settings that need one. /api/reboot is upstream's and
 // already behind the login; the firmware card's button only appears in some
@@ -2347,10 +2409,12 @@ $('bus-reboot').onclick=async()=>{
   const r=await api('/api/reboot');
   toast(r.ok?'Restarting…':(r.error||'failed'));
 };
-// The fields follow the dropdown at once, before any save.
-$('bus-proto').onchange=()=>busFields(+$('bus-proto').value||1);
+// The fields follow the controls at once, before any save.
+$('bus-rs485').onchange=$('bus-tcp-en').onchange=$('bus-bip-en').onchange=()=>busFields();
 $('bus-save').onclick=async()=>{
-  const r=await api('/api/bus',{proto:+$('bus-proto').value,
+  const r=await api('/api/bus',{rs485:+$('bus-rs485').value,
+                                tcp_en:$('bus-tcp-en').checked,
+                                bip_en:$('bus-bip-en').checked,
                                 address:+$('bus-addr').value,
                                 baud:+$('bus-baud').value,
                                 format:+$('bus-fmt').value,

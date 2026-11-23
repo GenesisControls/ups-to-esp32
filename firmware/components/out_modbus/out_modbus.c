@@ -56,20 +56,33 @@ static uint8_t  s_coil[(OUT_DISCRETE_N + 7) / 8];
  * rate without keeping timestamps for every frame. */
 #define RATE_BUCKETS    6
 #define RATE_BUCKET_US  (10LL * 1000000)
-static uint32_t s_bucket[RATE_BUCKETS];
-static int64_t  s_bucket_at_us;
-static int      s_bucket_i;
+/* PER-INSTANCE state. Two Modbus slaves can run at once -- RTU on the trunk
+ * and TCP on the network -- and everything that describes one of them has to
+ * be one of these rather than a file-level static.
+ *
+ * The register image above is deliberately NOT in here. Both instances serve
+ * from the same arrays, which is the whole point: one shared point set, so
+ * RTU and TCP cannot answer differently in the same second. */
+typedef struct {
+    void             *ctx;          /* the 2.x instance handle */
+    const char       *what;         /* "RTU" / "TCP", for logs */
+    bool              is_rtu;       /* collisions are a UART concept only */
+    out_modbus_stat_t stat;
+    SemaphoreHandle_t lock;
+    uint32_t          bucket[RATE_BUCKETS];
+    int64_t           bucket_at_us;
+    int               bucket_i;
+} inst_t;
 
+static inst_t s_rtu = { .what = "RTU", .is_rtu = true  };
+static inst_t s_tcp = { .what = "TCP", .is_rtu = false };
+
+/* The command coil and its rate limit are DEVICE-WIDE, not per instance. One
+ * self-test per thirty minutes is a statement about the battery, not about a
+ * transport, and keeping them per instance would let a master on the trunk
+ * and a client over TCP each start one inside the same window. */
 static uint8_t  s_cmd;          /* the command coil's one byte */
 static int64_t  s_cmd_last_us;
-static out_modbus_stat_t s_stat;
-static SemaphoreHandle_t s_stat_lock;
-/* 2.x is handle-based: every call takes the context that created it, which
- * is what makes an RTU slave and a TCP slave able to coexist at all. 1.x kept
- * one global slave_interface_ptr and a second init silently replaced the
- * first. Still ONE context here -- the two-instance split is its own change --
- * but the plumbing is now per-instance. */
-static void *s_ctx;
 
 /* The contiguous blocks of the address map, with the reserved ranges left
  * OUT. This is how "a planned address answers exception 02" is enforced: an
@@ -102,28 +115,21 @@ static void refresh(void)
     memcpy(s_coil, s_disc, sizeof(s_coil));
 }
 
-/* One task: refresh the image, and watch what the trunk does to it.
+/* One task per running instance: watch what its master does to the image.
  *
- * READ-ONLY, AND A CAVEAT WORTH READING. The other track's map says every
- * write is refused with exception 02, enforced in the datastore. pymodbus can
- * do that; esp-modbus 1.0 cannot -- a registered holding or coil area is
- * writable, and the stack has no read-only flag and no hook that runs before
- * the write lands. The choice is therefore between:
+ * READ-ONLY, AND HOW IT IS ENFORCED. The other track's map says every write
+ * is refused with an exception, enforced in the datastore. Under esp-modbus
+ * 1.x that was not possible -- a registered holding or coil area was
+ * writable, with no read-only flag and no hook before the write landed -- so
+ * this component used to register them writable and put the real value back
+ * on the next refresh, which left a window where a master could read what it
+ * had just written and produced no exception at all. That was a real
+ * deviation from the contract and was relayed to the other track as one.
  *
- *   (a) not registering the holding and coil areas, so writes fail -- but so
- *       do FC3 and FC1 READS, which the map explicitly requires ("mirrored
- *       as holding registers, so either function code works from Niagara");
- *   (b) registering them, and undoing any write immediately.
- *
- * (b), because breaking reads on half the function codes to make writes fail
- * correctly would be the worse trade for a site: a Niagara point sheet
- * configured against FC3 would simply stop working.
- *
- * So a write is accepted at the protocol level and then has no effect -- the
- * next refresh, within a second, puts the value back, and this counts it and
- * shows it on the status page. It does NOT produce exception 02. That is a
- * genuine deviation from the contract and belongs on the other track's desk,
- * not buried here. */
+ * It is gone. 2.x takes an access type per area, so the status registers and
+ * coils are MB_ACCESS_RO and the stack itself refuses the write. Only the
+ * command coil is writable, because cmd_check() has to see what was written
+ * in order to refuse it on its own terms. */
 /* Coil 100 went high. Everything that can refuse this, refuses it here.
  *
  * Reversing "read-only on the bus" was Tobias's call on 2026-11-22; the
@@ -131,7 +137,7 @@ static void refresh(void)
  * the board owner opts in, the UPS must say it can self-test, and the rate
  * limit means the worst a hostile or broken master achieves is one quick
  * test every half hour. */
-static void cmd_check(void)
+static void cmd_check(inst_t *in)
 {
     if (!(s_cmd & 1u)) return;
     s_cmd = 0;                                  /* a trigger, not a state */
@@ -162,74 +168,84 @@ static void cmd_check(void)
     esp_err_t e = ups_hid_command(UPS_CMD_TEST_QUICK, 0);
     ESP_LOGW(TAG, "QUICK BATTERY SELF-TEST started from the bus: %s. "
                   "The load is on battery while it runs.", esp_err_to_name(e));
-    xSemaphoreTake(s_stat_lock, portMAX_DELAY);
-    s_stat.tests_started++;
-    xSemaphoreGive(s_stat_lock);
+    xSemaphoreTake(in->lock, portMAX_DELAY);
+    in->stat.tests_started++;
+    xSemaphoreGive(in->lock);
 }
 
 static void mb_task(void *arg)
 {
-    (void)arg;
+    inst_t *in = (inst_t *)arg;
     const TickType_t period = pdMS_TO_TICKS(REFRESH_MS);
     TickType_t next = xTaskGetTickCount();
     for (;;) {
-        /* Drain whatever the trunk has done since the last pass. */
-        mb_event_group_t ev = mbc_slave_check_event(s_ctx,
+        /* Drain whatever this master has done since the last pass. */
+        mb_event_group_t ev = mbc_slave_check_event(in->ctx,
             MB_EVENT_HOLDING_REG_WR | MB_EVENT_HOLDING_REG_RD |
             MB_EVENT_INPUT_REG_RD   | MB_EVENT_COILS_WR       |
             MB_EVENT_COILS_RD       | MB_EVENT_DISCRETE_RD);
 
         if (ev) {
-            xSemaphoreTake(s_stat_lock, portMAX_DELAY);
-            s_stat.requests++;
-            s_bucket[s_bucket_i]++;
-            s_stat.last_request_us = esp_timer_get_time();
-            if (ev & MB_EVENT_INPUT_REG_RD)   s_stat.rd_input++;
-            if (ev & MB_EVENT_HOLDING_REG_RD) s_stat.rd_holding++;
-            if (ev & MB_EVENT_DISCRETE_RD)    s_stat.rd_discrete++;
-            if (ev & MB_EVENT_COILS_RD)       s_stat.rd_coil++;
+            xSemaphoreTake(in->lock, portMAX_DELAY);
+            in->stat.requests++;
+            in->bucket[in->bucket_i]++;
+            in->stat.last_request_us = esp_timer_get_time();
+            if (ev & MB_EVENT_INPUT_REG_RD)   in->stat.rd_input++;
+            if (ev & MB_EVENT_HOLDING_REG_RD) in->stat.rd_holding++;
+            if (ev & MB_EVENT_DISCRETE_RD)    in->stat.rd_discrete++;
+            if (ev & MB_EVENT_COILS_RD)       in->stat.rd_coil++;
             if (ev & (MB_EVENT_HOLDING_REG_WR | MB_EVENT_COILS_WR)) {
-                s_stat.writes_refused++;
+                in->stat.writes_refused++;
             }
-            xSemaphoreGive(s_stat_lock);
-            if (ev & MB_EVENT_COILS_WR) cmd_check();
-            /* No put-the-values-back pass any more: the status areas are
-             * MB_ACCESS_RO, so a write to one never reaches our buffer.
+            xSemaphoreGive(in->lock);
+            if (ev & MB_EVENT_COILS_WR) cmd_check(in);
+            /* No put-the-values-back pass: the status areas are MB_ACCESS_RO,
+             * so a write to one never reaches our buffer.
              *
              * UNVERIFIED, and worth checking against a real master: whether
              * 2.x still raises a _WR event for a write it refused itself. If
-             * it refuses before signalling, writes_refused above will read 0
-             * while writes are in fact being correctly rejected -- a worse
-             * counter but better behaviour on the wire, which is the right
-             * way round. The exception the master sees is the thing that
-             * matters, and the acceptance test checks that, not this. */
+             * it refuses before signalling, writes_refused will read 0 while
+             * writes are in fact being correctly rejected -- a worse counter
+             * for better behaviour on the wire, which is the right way
+             * round. The exception the master sees is what the acceptance
+             * test checks, not this. */
         }
 
-        /* Roll the rate window, and sample the collision flag. The flag is
-         * sticky until read, so reading it here both counts and clears it. */
+        /* Roll the rate window. */
         int64_t now_us = esp_timer_get_time();
-        if (now_us - s_bucket_at_us >= RATE_BUCKET_US) {
-            s_bucket_at_us = now_us;
-            s_bucket_i = (s_bucket_i + 1) % RATE_BUCKETS;
+        if (now_us - in->bucket_at_us >= RATE_BUCKET_US) {
+            in->bucket_at_us = now_us;
+            in->bucket_i = (in->bucket_i + 1) % RATE_BUCKETS;
             uint32_t sum = 0;
-            xSemaphoreTake(s_stat_lock, portMAX_DELAY);
-            s_bucket[s_bucket_i] = 0;               /* reuse the oldest */
-            for (int i = 0; i < RATE_BUCKETS; i++) sum += s_bucket[i];
-            s_stat.per_min = sum;
-            xSemaphoreGive(s_stat_lock);
-        }
-        bool collided = false;
-        if (uart_get_collision_flag(BOARD_RS485_UART, &collided) == ESP_OK && collided) {
-            xSemaphoreTake(s_stat_lock, portMAX_DELAY);
-            s_stat.collisions++;
-            xSemaphoreGive(s_stat_lock);
-            ESP_LOGW(TAG, "RS485 collision: another device keyed the line while we "
-                          "were transmitting -- check for a duplicate address");
+            xSemaphoreTake(in->lock, portMAX_DELAY);
+            in->bucket[in->bucket_i] = 0;           /* reuse the oldest */
+            for (int i = 0; i < RATE_BUCKETS; i++) sum += in->bucket[i];
+            in->stat.per_min = sum;
+            xSemaphoreGive(in->lock);
         }
 
+        /* Collisions are an RS485 fact: two devices keying one pair of wires.
+         * There is no such thing on a socket, so the TCP instance does not
+         * look -- and must not, since the flag belongs to a UART it may not
+         * even be sharing. The flag is sticky until read, so reading it here
+         * both counts and clears it. */
+        if (in->is_rtu) {
+            bool collided = false;
+            if (uart_get_collision_flag(BOARD_RS485_UART, &collided) == ESP_OK && collided) {
+                xSemaphoreTake(in->lock, portMAX_DELAY);
+                in->stat.collisions++;
+                xSemaphoreGive(in->lock);
+                ESP_LOGW(TAG, "RS485 collision: another device keyed the line while we "
+                              "were transmitting -- check for a duplicate address");
+            }
+        }
+
+        /* Only one instance needs to rebuild the shared image; the RTU task
+         * owns it when both are up, so the work is not done twice. refresh()
+         * is pure, so this is about waste rather than correctness. */
         if (xTaskGetTickCount() - next >= period) {
             next = xTaskGetTickCount();
-            refresh();
+            if (in->is_rtu || !s_rtu.ctx) refresh();
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -316,11 +332,16 @@ fail:
  * which is the only place this data belongs. */
 static esp_err_t start_tcp(int addr)
 {
+    inst_t *in = &s_tcp;
+
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (!netif) {
         ESP_LOGE(TAG, "Modbus TCP needs the Wi-Fi station interface, which is not up");
         return ESP_ERR_INVALID_STATE;
     }
+    in->lock = xSemaphoreCreateMutex();
+    if (!in->lock) return ESP_ERR_NO_MEM;
+
     /* ip_addr_table NULL accepts any client -- the brief's allowed-client
      * list is a later setting, and until it exists the honest position is
      * that anything on that LAN can read this. */
@@ -336,49 +357,38 @@ static esp_err_t start_tcp(int addr)
             .response_tout_ms = RESPONSE_TOUT_MS,
         },
     };
-    esp_err_t err = mbc_slave_create_tcp(&comm, &s_ctx);
+    esp_err_t err = mbc_slave_create_tcp(&comm, &in->ctx);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "slave create (TCP): %s", esp_err_to_name(err));
         return err;
     }
-    if ((err = areas_and_start(s_ctx)) != ESP_OK) return err;
+    if ((err = areas_and_start(in->ctx)) != ESP_OK) return err;
 
-    xSemaphoreTake(s_stat_lock, portMAX_DELAY);
-    s_stat.running = true;
-    s_stat.address = addr;
-    s_stat.baud    = 0;                 /* a socket has no baud rate */
-    s_stat.format  = "TCP";
-    s_stat.port    = port;
-    xSemaphoreGive(s_stat_lock);
+    xSemaphoreTake(in->lock, portMAX_DELAY);
+    in->stat.running = true;
+    in->stat.address = addr;
+    in->stat.baud    = 0;               /* a socket has no baud rate */
+    in->stat.format  = "TCP";
+    in->stat.port    = port;
+    xSemaphoreGive(in->lock);
 
-    if (xTaskCreate(mb_task, "out_mb", 3072, NULL, 4, NULL) != pdPASS) {
+    if (xTaskCreate(mb_task, "out_mb_tcp", 3072, in, 4, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "Modbus TCP slave up: unit %d on port %d, up to %d masters",
+    ESP_LOGI(TAG, "Modbus TCP slave up: unit %d on port %d, up to %d clients",
              addr, port, CONFIG_FMB_TCP_PORT_MAX_CONN);
-    ESP_LOGI(TAG, "bus commands %s (coil %d starts a quick self-test)",
-             out_common_cmd_enabled() ? "ENABLED" : "off", CMD_COIL_ADDR);
     return ESP_OK;
 }
 
-esp_err_t out_modbus_start(void)
+#if BOARD_HAS_RS485
+/* Modbus RTU on the trunk. */
+static esp_err_t start_rtu(int addr)
 {
-    const out_proto_t proto = out_common_proto();
-    if (proto != OUT_PROTO_MODBUS_RTU && proto != OUT_PROTO_MODBUS_TCP) {
-        return ESP_OK;                      /* not ours: cost the board nothing */
-    }
+    inst_t *in = &s_rtu;
 
-    s_stat_lock = xSemaphoreCreateMutex();
-    if (!s_stat_lock) return ESP_ERR_NO_MEM;
+    in->lock = xSemaphoreCreateMutex();
+    if (!in->lock) return ESP_ERR_NO_MEM;
 
-    const int addr = out_common_address();
-
-    if (proto == OUT_PROTO_MODBUS_TCP) return start_tcp(addr);
-
-#if !BOARD_HAS_RS485
-    ESP_LOGE(TAG, "Modbus RTU selected, but this board has no RS485 transceiver");
-    return ESP_ERR_NOT_SUPPORTED;
-#else
     int baud = out_common_baud();
     if (baud == OUT_BAUD_AUTO) {
         baud = BAUD_FALLBACK;
@@ -405,13 +415,13 @@ esp_err_t out_modbus_start(void)
             .response_tout_ms = RESPONSE_TOUT_MS,
         },
     };
-    esp_err_t err = mbc_slave_create_serial(&comm, &s_ctx);
+    esp_err_t err = mbc_slave_create_serial(&comm, &in->ctx);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "slave create (serial): %s", esp_err_to_name(err));
         return err;
     }
 
-    if ((err = areas_and_start(s_ctx)) != ESP_OK) return err;
+    if ((err = areas_and_start(in->ctx)) != ESP_OK) return err;
 
     /* After the stack has the UART. The driver-enable is the peripheral's own
      * RTS in half-duplex mode -- see board.h; keying it in software is a race
@@ -425,30 +435,73 @@ esp_err_t out_modbus_start(void)
         ESP_LOGE(TAG, "uart_set_mode RS485: %s", esp_err_to_name(err));
         return err;
     }
-    xSemaphoreTake(s_stat_lock, portMAX_DELAY);
-    s_stat.running = true;
-    s_stat.address = addr;
-    s_stat.baud    = baud;
-    s_stat.format  = out_common_format_name(fmt);
-    xSemaphoreGive(s_stat_lock);
 
-    if (xTaskCreate(mb_task, "out_mb", 3072, NULL, 4, NULL) != pdPASS) {
+    xSemaphoreTake(in->lock, portMAX_DELAY);
+    in->stat.running = true;
+    in->stat.address = addr;
+    in->stat.baud    = baud;
+    in->stat.format  = out_common_format_name(fmt);
+    in->stat.port    = 0;
+    xSemaphoreGive(in->lock);
+
+    if (xTaskCreate(mb_task, "out_mb_rtu", 3072, in, 4, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG, "Modbus RTU slave up: address %d, %d baud %s, "
                   "TX %d RX %d DE %d (hardware RTS)",
              addr, baud, out_common_format_name(fmt),
              BOARD_PIN_RS485_TX, BOARD_PIN_RS485_RX, BOARD_PIN_RS485_DE);
+    return ESP_OK;
+}
+#endif /* BOARD_HAS_RS485 */
+
+esp_err_t out_modbus_start(void)
+{
+    /* TWO INDEPENDENT OUTPUTS. RTU is the trunk's protocol, at most one of
+     * which runs; TCP is a separate switch. Both at once is the case this
+     * whole esp-modbus 2.x migration was for.
+     *
+     * The address is shared: it is the RTU station address and the TCP unit
+     * id, one number because a site thinks of it as one. */
+    const bool want_rtu = (out_common_rs485() == OUT_PROTO_MODBUS_RTU);
+    const bool want_tcp = out_common_tcp_enabled();
+    if (!want_rtu && !want_tcp) {
+        return ESP_OK;                      /* not ours: cost the board nothing */
+    }
+
+    const int addr = out_common_address();
+    esp_err_t worst = ESP_OK;
+
+    if (want_rtu) {
+#if BOARD_HAS_RS485
+        esp_err_t e = start_rtu(addr);
+#else
+        ESP_LOGE(TAG, "Modbus RTU selected, but this board has no RS485 transceiver");
+        esp_err_t e = ESP_ERR_NOT_SUPPORTED;
+#endif
+        /* Deliberately NOT a return. These outputs are independent, so a
+         * trunk that will not come up must not take Modbus TCP down with it
+         * -- the site watching over the network keeps working, and the
+         * failure is visible on the page and in the log. */
+        if (e != ESP_OK) worst = e;
+    }
+    if (want_tcp) {
+        esp_err_t e = start_tcp(addr);
+        if (e != ESP_OK && worst == ESP_OK) worst = e;
+    }
+
     ESP_LOGI(TAG, "bus commands %s (coil %d starts a quick self-test)",
              out_common_cmd_enabled() ? "ENABLED" : "off", CMD_COIL_ADDR);
-    return ESP_OK;
-#endif /* BOARD_HAS_RS485 */
+    return worst;
 }
 
-void out_modbus_get(out_modbus_stat_t *out)
+static void get_one(inst_t *in, out_modbus_stat_t *out)
 {
-    if (!s_stat_lock) { memset(out, 0, sizeof(*out)); return; }
-    xSemaphoreTake(s_stat_lock, portMAX_DELAY);
-    *out = s_stat;
-    xSemaphoreGive(s_stat_lock);
+    if (!in->lock) { memset(out, 0, sizeof(*out)); return; }
+    xSemaphoreTake(in->lock, portMAX_DELAY);
+    *out = in->stat;
+    xSemaphoreGive(in->lock);
 }
+
+void out_modbus_get_rtu(out_modbus_stat_t *out) { get_one(&s_rtu, out); }
+void out_modbus_get_tcp(out_modbus_stat_t *out) { get_one(&s_tcp, out); }

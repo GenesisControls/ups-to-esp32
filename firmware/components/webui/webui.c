@@ -358,54 +358,78 @@ static esp_err_t get_status(httpd_req_t *req)
      * answer is the network's, not the board type's -- an RS485 board that
      * joined a Wi-Fi can serve them perfectly well. */
     {
-        out_modbus_stat_t mb;
-        out_modbus_get(&mb);
+        out_modbus_stat_t rtu, tcp;
+        out_modbus_get_rtu(&rtu);
+        out_modbus_get_tcp(&tcp);
         out_bacnet_stat_t bac;
         out_bacnet_get(&bac);
 
-        /* WHICHEVER OUTPUT IS ACTUALLY RUNNING owns running/requests/quiet.
-         * Reading them from out_modbus unconditionally would tell a board
-         * serving MS/TP that its protocol "is selected but not running",
-         * because the Modbus stat is all zeroes on that board. The
-         * Modbus-only counters below stay Modbus-only: a write refused and a
-         * per-access-type read count have no BACnet equivalent, so they are
-         * zero there rather than faked. */
-        const bool on_bac = out_common_proto() == OUT_PROTO_BACNET_MSTP;
-        const bool running = on_bac ? bac.running : mb.running;
-        const uint32_t reqs = on_bac ? bac.requests : mb.requests;
-        const int64_t  last = on_bac ? bac.last_request_us : mb.last_request_us;
+        /* THREE OUTPUTS, each reported separately, because up to three run at
+         * once. The old shape had one "running" and one request count, which
+         * cannot describe a board serving BACnet MS/TP on the trunk while
+         * answering Modbus TCP over Wi-Fi.
+         *
+         * Note has485 rather than rs485 for the capability: "rs485" now names
+         * the trunk's PROTOCOL, and leaving the old key meaning "this board
+         * has a transceiver" would have been a silent collision. */
+        const int64_t now = esp_timer_get_time();
+        #define QUIET(us) ((us) ? (long long)((now - (us)) / 1000000) : -1LL)
 
         n += snprintf(AT(n), ROOM(n),
-                  ",\"bus\":{\"proto\":%d,\"address\":%d,\"baud\":%d,\"format\":%d,"
-                  "\"rs485\":%s,\"ip\":%s,\"running\":%s,"
-                  "\"requests\":%u,\"writes\":%u,\"quiet_s\":%lld,"
-                  "\"per_min\":%u,\"collisions\":%u,\"tests\":%u,"
-                  "\"rd\":[%u,%u,%u,%u],\"cmd\":%s,"
+                  ",\"bus\":{\"rs485\":%d,\"tcp_en\":%s,\"bip_en\":%s,"
+                  "\"has485\":%s,\"ip\":%s,"
+                  "\"address\":%d,\"baud\":%d,\"format\":%d,\"cmd\":%s,"
                   "\"devid\":%lu,\"devid_set\":%lu,\"devname\":\"%s\","
                   "\"infofr\":%d,\"maxmast\":%d,\"bacnet_net\":%d,"
-                  "\"mbport\":%d,\"bipport\":%d,\"port\":%d}",
-                  (int)out_common_proto(), out_common_address(), out_common_baud(),
-                  (int)out_common_format(),
+                  "\"mbport\":%d,\"bipport\":%d",
+                  (int)out_common_rs485(),
+                  out_common_tcp_enabled() ? "true" : "false",
+                  out_common_bip_enabled() ? "true" : "false",
                   BOARD_HAS_RS485 ? "true" : "false",
                   netmgr_state() == NETMGR_STA_CONNECTED ? "true" : "false",
-                  running ? "true" : "false",
-                  (unsigned)reqs, (unsigned)mb.writes_refused,
-                  last ? (long long)((esp_timer_get_time() - last) / 1000000) : -1LL,
-                  (unsigned)mb.per_min, (unsigned)mb.collisions,
-                  (unsigned)mb.tests_started,
-                  (unsigned)mb.rd_input, (unsigned)mb.rd_holding,
-                  (unsigned)mb.rd_discrete, (unsigned)mb.rd_coil,
+                  out_common_address(), out_common_baud(),
+                  (int)out_common_format(),
                   out_common_cmd_enabled() ? "true" : "false",
-                  /* devid is what is IN USE (derived or configured); devid_set
-                   * is what is stored, so the page can show "derived" rather
-                   * than pretending the number was typed in. */
                   (unsigned long)(bac.instance ? bac.instance : out_common_device_id()),
                   (unsigned long)out_common_device_id(),
                   jesc(bac.device_name, e1, sizeof(e1)),
                   out_common_info_frames(), out_common_max_master(),
                   out_common_bacnet_net(),
-                  out_common_mb_tcp_port(), out_common_bip_port(),
-                  on_bac ? 0 : mb.port);
+                  out_common_mb_tcp_port(), out_common_bip_port());
+
+        /* Modbus RTU on the trunk. collisions and the per-access read counts
+         * live here because they are serial facts. */
+        n += snprintf(AT(n), ROOM(n),
+                  ",\"rtu\":{\"running\":%s,\"requests\":%u,\"quiet_s\":%lld,"
+                  "\"per_min\":%u,\"collisions\":%u,\"writes\":%u,\"tests\":%u,"
+                  "\"baud\":%d,\"format\":\"%s\",\"rd\":[%u,%u,%u,%u]}",
+                  rtu.running ? "true" : "false", (unsigned)rtu.requests, QUIET(rtu.last_request_us),
+                  (unsigned)rtu.per_min, (unsigned)rtu.collisions,
+                  (unsigned)rtu.writes_refused, (unsigned)rtu.tests_started,
+                  rtu.baud, rtu.format ? rtu.format : "",
+                  (unsigned)rtu.rd_input, (unsigned)rtu.rd_holding,
+                  (unsigned)rtu.rd_discrete, (unsigned)rtu.rd_coil);
+
+        /* Modbus TCP. No collisions on a socket. */
+        n += snprintf(AT(n), ROOM(n),
+                  ",\"tcp\":{\"running\":%s,\"requests\":%u,\"quiet_s\":%lld,"
+                  "\"per_min\":%u,\"writes\":%u,\"tests\":%u,\"port\":%d,"
+                  "\"rd\":[%u,%u,%u,%u]}",
+                  tcp.running ? "true" : "false", (unsigned)tcp.requests, QUIET(tcp.last_request_us),
+                  (unsigned)tcp.per_min, (unsigned)tcp.writes_refused,
+                  (unsigned)tcp.tests_started, tcp.port,
+                  (unsigned)tcp.rd_input, (unsigned)tcp.rd_holding,
+                  (unsigned)tcp.rd_discrete, (unsigned)tcp.rd_coil);
+
+        /* BACnet MS/TP. Its counter is NPDUs handled, not Modbus frames. */
+        n += snprintf(AT(n), ROOM(n),
+                  ",\"mstp\":{\"running\":%s,\"requests\":%u,\"quiet_s\":%lld,"
+                  "\"baud\":%d,\"mac\":%d,\"bytes_tx\":%u,\"bytes_rx\":%u}}",
+                  bac.running ? "true" : "false", (unsigned)bac.requests,
+                  QUIET(bac.last_request_us),
+                  bac.baud, bac.mac,
+                  (unsigned)bac.bytes_tx, (unsigned)bac.bytes_rx);
+        #undef QUIET
     }
 #if CONFIG_UPSA_TAILSCALE
     /* Present only in a Tailscale build, so the page can tell "not in this
@@ -1359,43 +1383,60 @@ static esp_err_t post_bus(httpd_req_t *req)
      * when the second is refused. Switching to MS/TP with address 200 stored
      * is the case that matters: refuse it and say why, rather than clamp to
      * something the BMS is not polling. */
-    const int want_proto = BUS_INT(root, "proto", (int)out_common_proto());
+    /* THE TRUNK and THE TWO TOGGLES. rs485 is one-of-three; tcp_en and
+     * bip_en are independent of it and of each other. */
+    const int want_rs485 = BUS_INT(root, "rs485", (int)out_common_rs485());
     const int want_addr  = BUS_INT(root, "address", out_common_address());
+    const cJSON *jtcp = cJSON_GetObjectItemCaseSensitive(root, "tcp_en");
+    const cJSON *jbip = cJSON_GetObjectItemCaseSensitive(root, "bip_en");
+    const bool want_tcp = cJSON_IsBool(jtcp) ? cJSON_IsTrue(jtcp)
+                                             : out_common_tcp_enabled();
+    const bool want_bip = cJSON_IsBool(jbip) ? cJSON_IsTrue(jbip)
+                                             : out_common_bip_enabled();
 
-    if (want_proto < OUT_PROTO_NONE || want_proto > OUT_PROTO_BACNET_IP) {
-        why = "not a protocol this firmware knows";
-    } else if (want_proto == OUT_PROTO_BACNET_IP) {
-        /* In the enum, served by nothing: out_bacnet compiles the MS/TP
-         * datalink only (BACDL_MSTP). Its settings are stored and validated
-         * so the datalink needs no second settings pass, but selecting it
-         * would leave the board silent while the page named a protocol. */
-        why = "BACnet/IP is not in this firmware yet";
-    } else if ((want_proto == OUT_PROTO_MODBUS_RTU ||
-                want_proto == OUT_PROTO_BACNET_MSTP) && !BOARD_HAS_RS485) {
+    if (want_rs485 != OUT_PROTO_NONE &&
+        want_rs485 != OUT_PROTO_MODBUS_RTU &&
+        want_rs485 != OUT_PROTO_BACNET_MSTP) {
+        /* The IP protocols are no longer values this field can hold: they are
+         * their own switches. A caller sending the old single "proto" would
+         * land here, which is the right answer -- the shape changed. */
+        why = "the RS485 trunk carries Modbus RTU or BACnet MS/TP, or nothing";
+    } else if (want_rs485 != OUT_PROTO_NONE && !BOARD_HAS_RS485) {
         why = "this board has no RS485 transceiver";
-    } else if (want_proto == OUT_PROTO_MODBUS_TCP &&
-               netmgr_state() != NETMGR_STA_CONNECTED) {
+    } else if (want_tcp && netmgr_state() != NETMGR_STA_CONNECTED) {
         why = "Modbus TCP needs the board to have joined a network";
-    } else if (!out_common_address_valid(want_addr, (out_proto_t)want_proto)) {
-        why = (want_proto == OUT_PROTO_BACNET_MSTP)
+    } else if (want_bip) {
+        /* Stored and validated so the datalink needs no second settings
+         * pass, but out_bacnet compiles BACDL_MSTP only, so enabling it
+         * would serve nothing. */
+        why = "BACnet/IP is not in this firmware yet";
+    } else if (!out_common_address_valid(want_addr, (out_proto_t)want_rs485)) {
+        /* Judged against the TRUNK, whose range is the narrower of the two
+         * when MS/TP is selected. Modbus TCP shares the number and allows
+         * 1-247, so anything legal for the trunk is legal for TCP too. */
+        why = (want_rs485 == OUT_PROTO_BACNET_MSTP)
                   ? "a BACnet MS/TP MAC must be 0-127"
                   : "a Modbus address must be 1-247";
     }
 
-    /* ORDER MATTERS: the protocol goes in FIRST.
+    /* ORDER MATTERS: the trunk protocol goes in FIRST.
      *
-     * out_common_set_address() validates against the protocol in force, so
-     * writing the address first lets the OLD protocol judge the NEW address.
-     * Changing MS/TP (MAC 100) to Modbus TCP (unit 200) would then pass the
-     * pair check above and be refused by the setter, because MS/TP's 0-127
-     * limit still applied at that moment. Protocol first, and the address is
-     * judged by the protocol it will actually run under -- which the pair
-     * check has already approved, so the only way it fails here is NVS. */
-    if (!why && out_common_set_proto((out_proto_t)want_proto) != ESP_OK) {
-        why = "could not save the protocol";
+     * out_common_set_address() validates against the trunk setting in force,
+     * so writing the address first lets the OLD protocol judge the NEW
+     * address -- changing MS/TP (MAC 100) to Modbus RTU (address 200) would
+     * pass the pair check above and then be refused by the setter, because
+     * MS/TP's 0-127 limit still applied at that moment. */
+    if (!why && out_common_set_rs485((out_proto_t)want_rs485) != ESP_OK) {
+        why = "could not save the trunk protocol";
     }
     if (!why && out_common_set_address(want_addr) != ESP_OK) {
         why = "could not save the address";
+    }
+    if (!why && out_common_set_tcp_enabled(want_tcp) != ESP_OK) {
+        why = "could not save the Modbus TCP setting";
+    }
+    if (!why && out_common_set_bip_enabled(want_bip) != ESP_OK) {
+        why = "could not save the BACnet/IP setting";
     }
 
     BUS_SET(root, "baud", out_common_set_baud(jj->valueint),

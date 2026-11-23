@@ -68,6 +68,13 @@ typedef struct {
      * other devices work; a duplicate address shows up as collisions. */
 } out_modbus_stat_t;
 
-void out_modbus_get(out_modbus_stat_t *out);
+/* One snapshot per instance. Both can be running, so there is no single
+ * "the Modbus stats" to ask for; a stopped instance zeroes the struct.
+ *
+ * collisions and the per-access read counters are meaningful on RTU and
+ * mostly not on TCP: a socket has no collisions, and a TCP master's reads are
+ * counted the same way but against its own instance. */
+void out_modbus_get_rtu(out_modbus_stat_t *out);
+void out_modbus_get_tcp(out_modbus_stat_t *out);
 
 #endif /* GENESIS_OUT_MODBUS_H */

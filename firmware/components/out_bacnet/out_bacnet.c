@@ -256,7 +256,7 @@ static void bac_task(void *arg)
 
 esp_err_t out_bacnet_start(void)
 {
-    if (out_common_proto() != OUT_PROTO_BACNET_MSTP) {
+    if (out_common_rs485() != OUT_PROTO_BACNET_MSTP) {
         return ESP_OK;                  /* not ours: cost the board nothing */
     }
 
@@ -370,7 +370,7 @@ void out_bacnet_get(out_bacnet_stat_t *out)
 
 esp_err_t out_bacnet_start(void)
 {
-    if (out_common_proto() != OUT_PROTO_BACNET_MSTP) return ESP_OK;
+    if (out_common_rs485() != OUT_PROTO_BACNET_MSTP) return ESP_OK;
     ESP_LOGE(TAG, "BACnet MS/TP selected, but this board has no RS485 transceiver");
     return ESP_ERR_NOT_SUPPORTED;
 }
