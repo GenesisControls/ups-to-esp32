@@ -327,6 +327,7 @@ static esp_err_t get_status(httpd_req_t *req)
                   jesc(crashlog_last(), e1, sizeof(e1)));
     /* The fleet heartbeat: whether it is built in, what the owner allows, and
      * how the last one went. last_ok is seconds ago, -1 if never this boot. */
+#ifndef CONFIG_UPSA_FLEET_DISABLED
     fleet_status_t f;
     fleet_get(&f);
     char desc_res[64];
@@ -335,16 +336,34 @@ static esp_err_t get_status(httpd_req_t *req)
     n += snprintf(AT(n), ROOM(n),
                   "\"fleet\":{\"configured\":%s,\"enabled\":%s,\"stats\":%s,\"stats_auto\":%s,"
                   "\"channel\":\"%s\",\"sent\":%u,\"last_ok\":%lld,\"error\":\"%s\","
-                  "\"desc\":\"%s\"},"
-                  "\"auth\":{\"enabled\":%s,\"default\":%s},"
-                  "\"setup_screen\":%s",
+                  "\"desc\":\"%s\"},",
                   f.configured ? "true" : "false", f.enabled ? "true" : "false",
                   f.stats ? "true" : "false", f.stats_auto ? "true" : "false",
                   jesc(f.channel, e2, sizeof(e2)),
                   (unsigned)f.sent,
                   (long long)(f.last_ok_s < 0 ? -1 : now_s - f.last_ok_s),
                   jesc(f.last_error, e1, sizeof(e1)),
-                  jesc(desc_res, e3, sizeof(e3)),
+                  jesc(desc_res, e3, sizeof(e3)));
+#endif
+    /* OMITTED ENTIRELY when the check-in is compiled out, which is what makes
+     * its whole card disappear without a line of page code: fleet(s) opens
+     * with "const f = s.fleet; if (!f) return;" and every other reference in
+     * the page guards with s.fleet && ... So no object means no card, no
+     * "Check-in" entry, and no "send this UPS to the developer" card either
+     * -- that one is rendered by fleet() too, and never runs.
+     *
+     * Reporting it as "not configured" was accurate and still wrong for a
+     * Genesis build: it advertised a feature this firmware does not contain,
+     * on a page a customer's staff will read. An upstream build is untouched
+     * and shows the card exactly as before.
+     *
+     * The /api/fleet routes stay registered and are inert -- fleet_start()
+     * returns before creating its task, so nothing can be switched on by
+     * reaching them. Removing them would mean touching ROUTE_COUNT and
+     * upstream's handler table for no behaviour change. */
+    n += snprintf(AT(n), ROOM(n),
+                  "\"auth\":{\"enabled\":%s,\"default\":%s},"
+                  "\"setup_screen\":%s",
                   auth_enabled() ? "true" : "false",
                   auth_is_default() ? "true" : "false",
 #if CONFIG_UPSA_SETUP_SCREEN
