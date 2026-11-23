@@ -79,7 +79,7 @@ protected load from an unprotected one.
 | | *— 16–23 describe the adapter —* | | |
 | 16 | Firmware version | major×100 + minor | never |
 | 17 | Restart counter | count | never |
-| 18 | Last restart reason | `esp_reset_reason_t` | never |
+| 18 | Last restart reason | enum below | never |
 
 Scale `V × 10` in Niagara: divide by 10. 2304 is 230.4 V.
 
@@ -98,16 +98,54 @@ and 7 readable: boost and trim say the mains left the transfer window, 10 and
 
 | Value | Meaning |
 |---|---|
-| 0 | no test since power-up / unknown |
 | 1 | passed |
 | 2 | done, warning |
 | 3 | failed |
 | 4 | in progress |
 | 5 | aborted |
+| 6 | scheduled — the other track's value; this adapter never produces it |
+| **7** | **unknown / no test since power-up** |
+| 0 | not used |
 | 65535 | this UPS cannot self-test, or comm lost |
 
-Matches the other track's encoding exactly. 6 (*scheduled*) exists in that
-encoding and is not produced here.
+**Unknown moved from 0 to 7 on 2026-11-23.** Every enumerated point here
+starts at 1, so the number read over BACnet is the number read over Modbus. A
+BACnet Multi-State Input's present value is 1..N by ANSI/ASHRAE 135, so an
+encoding with a meaningful 0 would have forced an off-by-one on this one
+register — exactly what gets an engineer to map a 3 onto a 3 and be wrong.
+
+1–6 are untouched. They belong to the other track and 6 stays *scheduled*
+rather than being reused.
+
+> **This changes the shared map.** Register 9 is published in
+> `ups-modbus-monitoring/README.md`, where it is still marked *planned* and
+> its encoding *provisional*. That track has to be told.
+
+#### Register 18 — last restart reason
+
+1-based for the same reason, and this encoding is **ours**: the other track's
+README calls register 18 "track-specific in its encoding, not its meaning"
+and publishes 65535 there.
+
+| Value | Meaning | | Value | Meaning |
+|---|---|---|---|---|
+| 1 | Unknown | | 9 | Deep sleep |
+| 2 | Power-on | | 10 | Brownout |
+| 3 | External pin | | 11 | SDIO |
+| 4 | Software restart | | 12 | USB peripheral |
+| 5 | Panic | | 13 | JTAG |
+| 6 | Interrupt watchdog | | 14 | eFuse error |
+| 7 | **Task watchdog** | | 15 | Power glitch |
+| 8 | Other watchdog | | 16 | CPU lockup |
+
+It is `esp_reset_reason_t` plus one. That enum is append-only upstream, so a
+value ESP-IDF adds later reads as **1, Unknown** rather than as an unnamed
+state.
+
+Worth knowing which ones matter: **5 (Panic)** and **7 (Task watchdog)** mean
+the firmware crashed, **10 (Brownout)** means the supply sagged — the one to
+watch on a board powered from the UPS's own USB port — and **2 (Power-on)**
+after an unattended period means the board lost power.
 
 ### Reserved addresses — 12–15 and 19–23
 
@@ -178,16 +216,30 @@ point — see the end of this section.
 | BI6 | **UPS comm OK** | | AI6 | Battery voltage (V) |
 | BI7 | AVR boost active | | AI7 | Heartbeat |
 | BI8 | AVR trim active | | AI9 | Days since battery change (d) |
-| BI9 | Charging | | AI10 | Self-test result |
+| BI9 | Charging | | **MSI10** | Self-test result |
 | BI10 | Battery age alarm | | AI11 | Input transfer low (V) |
 | BI11 | Output not protecting | | AI12 | Input transfer high (V) |
 | | | | AI17 | Firmware version |
 | | | | AI18 | Restart counter |
-| | | | AI19 | Last restart reason |
+| | | | **MSI19** | Last restart reason |
 
 **There is no AI8.** Modbus register 7 is the status bitfield, and a float
 whose value is `0b101101` is a Modbus workaround, not data — every bit of it
 is already BI1–BI6.
+
+**MSI10 and MSI19 are Multi-State Inputs, not Analog Inputs**, because they
+are enumerations rather than measurements. Each state carries its text, so a
+BMS shows `Task watchdog` where an AI could only show `7.0`. Multi-State
+Input is a different object type from Analog Input, so the instance rule is
+unchanged — still the Modbus address + 1 — and MSI10 collides with nothing.
+
+**The state numbers are the register's own**, with no offset. Both encodings
+were made 1-based so that a 4 on Modbus is state 4 here. The state text is
+listed under registers 9 and 18 above.
+
+**The binaries carry text too.** Every BI reports what it means rather than
+Active/Inactive — BI2 reads **On battery / On mains**, BI11 reads
+**Not protecting / Protecting**, BI6 reads **OK / Lost**.
 
 **Volts are volts.** AI4 reads 230.4, not 2304: an Analog Input is a float
 with a units property, so the ×10 integer trick Modbus needs is not used

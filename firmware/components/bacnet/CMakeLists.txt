@@ -11,6 +11,11 @@
 #   - bo.c (Binary Output) is left OUT. A BO models a physical output this
 #     board does not have, and in this stack it is commandable: a priority
 #     array, a relinquish default and a second way to set the same value.
+#   - ms-input.c (Multi-State Input) is ADDED, with its helper
+#     basic/sys/state_name.c, for the two registers that are enumerations
+#     rather than measurements. state_name.c strdup()s every label, so unlike
+#     the device object's name there is no lifetime question about the state
+#     text we hand it.
 #   - bv.c (Binary Value) is ADDED, for the one writable point on the device:
 #     BV1, which starts a battery self-test. It is NOT commandable here,
 #     because BACNET_OBJECT_BINARY_VALUE_COMMANDABLE is not defined below --
@@ -58,6 +63,7 @@ set(BACNET_SRCS
     "src/bacnet/basic/object/ai.c"
     "src/bacnet/basic/object/bi.c"
     "src/bacnet/basic/object/bv.c"
+    "src/bacnet/basic/object/ms-input.c"
 
     # --- service handlers: everything a BMS asks an MS/TP device ---
     "src/bacnet/basic/service/h_apdu.c"
@@ -84,6 +90,7 @@ set(BACNET_SRCS
     "src/bacnet/basic/sys/keylist.c"
     "src/bacnet/basic/sys/mstimer.c"
     "src/bacnet/basic/sys/ringbuf.c"
+    "src/bacnet/basic/sys/state_name.c"
 
     # --- MS/TP datalink ---
     "src/bacnet/datalink/cobs.c"
@@ -117,6 +124,7 @@ target_compile_definitions(${COMPONENT_LIB} PUBLIC
     CONFIG_BACNET_BASIC_OBJECT_ANALOG_INPUT
     CONFIG_BACNET_BASIC_OBJECT_BINARY_INPUT
     CONFIG_BACNET_BASIC_OBJECT_BINARY_VALUE
+    CONFIG_BACNET_BASIC_OBJECT_MULTISTATE_INPUT
     # NOT defined, on purpose: BACNET_OBJECT_BINARY_VALUE_COMMANDABLE, and
     # INTRINSIC_REPORTING / BINARY_VALUE_INTRINSIC_REPORTING. The first would
     # give BV1 a priority array it has no use for; the second is what guards

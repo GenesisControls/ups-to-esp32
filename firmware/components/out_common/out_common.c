@@ -97,22 +97,51 @@ static uint16_t meas(bool live, float v, float scale)
  * settle it, this maps upstream's reading onto the published numbering,
  * because the published numbering is what Niagara was pointed at.
  *
- * NOT_RUN has no counterpart over there ("scheduled" is a different claim),
- * so it lands on 0, "no test initiated / unknown" -- which is what NOT_RUN
- * means, and is the value the bench APC returns at rest. */
+ * UNKNOWN IS 7, NOT 0 -- changed 2026-11-23 on Tobias's instruction.
+ *
+ * Every enumerated point in this project starts at 1, so that the number a
+ * BMS reads over BACnet is the number a BMS reads over Modbus. A BACnet
+ * Multi-State Input's present-value is 1..N by ANSI/ASHRAE 135, so an
+ * encoding with a meaningful 0 would have forced an off-by-one between the
+ * two protocols for this one register -- exactly the kind of difference that
+ * gets a commissioning engineer to map a 3 onto a 3 and be wrong.
+ *
+ * So "unknown" moved off 0 and onto 7. 1-6 are untouched, which matters: the
+ * other track's published table owns them, and 6 stays "scheduled" there
+ * rather than being reused. 0 is now simply not produced.
+ *
+ * NOT_RUN still has no counterpart over there ("scheduled" is a different
+ * claim), so it lands on unknown -- which is what NOT_RUN means, and is what
+ * the bench APC returns at rest. We never emit 6; no upstream state maps to
+ * it. */
+#define TEST_UNKNOWN  7u
+
 static uint16_t test_result(bool live, uint8_t upstream_value)
 {
     if (!live) return OUT_ABSENT;
     switch (upstream_value) {
-    case UPS_TEST_NO_TEST:     return 0;
+    case UPS_TEST_NO_TEST:     return TEST_UNKNOWN;
     case UPS_TEST_PASSED:      return 1;
     case UPS_TEST_WARNING:     return 2;
     case UPS_TEST_ERROR:       return 3;
     case UPS_TEST_IN_PROGRESS: return 4;
     case UPS_TEST_ABORTED:     return 5;
-    case UPS_TEST_NOT_RUN:     return 0;
+    case UPS_TEST_NOT_RUN:     return TEST_UNKNOWN;
     default:                   return OUT_ABSENT;
     }
+}
+
+/* Register 18, 1-based for the same reason.
+ *
+ * Its encoding is ours: the other track's README says register 18 is
+ * "track-specific in its encoding, not its meaning" and publishes 65535
+ * there. esp_reset_reason_t starts at 0 and is append-only, so one added at
+ * publish time gives a clean 1..16 that needs no second table, and a value
+ * ESP-IDF adds past the end of out_bacnet's name list reads as state 1,
+ * "Unknown", rather than as an unnamed state. */
+static uint16_t restart_reason(void)
+{
+    return (uint16_t)((unsigned)esp_reset_reason() + 1u);
 }
 
 /* Days since the battery was last changed, from our stored date if one is
@@ -240,7 +269,7 @@ static void build(out_points_t *p)
      * is the point of giving them their own block. */
     p->reg[OUT_R_FW_VERSION]   = fw_version();
     p->reg[OUT_R_RESET_COUNT]  = s_boots;
-    p->reg[OUT_R_RESET_REASON] = (uint16_t)esp_reset_reason();
+    p->reg[OUT_R_RESET_REASON] = restart_reason();
 
     /* Which addresses exist at all. Everything not set here is absent from
      * the datastore and answers Modbus exception 02, NOT 65535. */

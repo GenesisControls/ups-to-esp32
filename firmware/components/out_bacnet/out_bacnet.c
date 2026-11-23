@@ -7,6 +7,9 @@
  *
  *     BI1..BI11  <- discretes 0..10
  *     AI1..AI19  <- registers 0..18, minus the ones that make no sense here
+ *     MSI10/MSI19 <- registers 9 and 18, which are enumerations rather than
+ *                    measurements, so they are Multi-State Inputs with named
+ *                    states instead of floats a person has to decode
  *
  * This deliberately departs from the "BACnet (proposed)" table in the project
  * brief, which had BI1 = On battery and BI2 = Online -- the reverse of the
@@ -99,6 +102,7 @@ static const char *TAG = "out_bac";
 #include "bacnet/basic/object/ai.h"
 #include "bacnet/basic/object/bi.h"
 #include "bacnet/basic/object/bv.h"
+#include "bacnet/basic/object/ms-input.h"
 #include "bacnet/basic/object/device.h"
 #include "bacnet/basic/services.h"
 #include "bacnet/basic/sys/mstimer.h"
@@ -115,9 +119,26 @@ static const char *TAG = "out_bac";
  *   7  status bitfield -- every bit of it is already BI1..BI6. A float whose
  *      value is 0b101101 is not data, it is a Modbus workaround.
  */
+/* The two registers that are ENUMERATIONS rather than measurements. BACnet
+ * has an object type for exactly this, so they are Multi-State Inputs and a
+ * BMS shows "Task watchdog" where an AI could only show 7.0.
+ *
+ * The instance rule does not change: still the Modbus address + 1. MSI and AI
+ * are different object types, so MSI10 collides with nothing, and the point
+ * list keeps one arithmetic rule for every object on the device.
+ *
+ * Nor do the VALUES change between protocols. An MSI present-value is 1..N by
+ * ANSI/ASHRAE 135, and both these registers were made 1-based in out_common
+ * for that reason, so a 4 on Modbus is state 4 here. */
+static bool reg_is_enum(int addr)
+{
+    return addr == OUT_R_TEST_RESULT || addr == OUT_R_RESET_REASON;
+}
+
 static bool reg_is_bacnet_point(int addr)
 {
     if (addr == OUT_R_STATUS_BITS) return false;
+    if (reg_is_enum(addr)) return false;          /* served as an MSI below */
     return out_common_reg_name(addr)[0] != '\0';   /* "" = reserved address */
 }
 
@@ -141,6 +162,63 @@ static BACNET_ENGINEERING_UNITS reg_units(int addr, float *divisor)
  * why Modbus put it at 100, far outside its data block. One BV on the device,
  * numbered 1, is what an engineer browsing it expects to find. */
 #define SELFTEST_BV     1
+
+/* STATE TEXT, in the format basic/sys/state_name.c parses: NUL-separated C
+ * strings with an empty one at the end. Index + 1 is the state number, which
+ * is also the register's own value.
+ *
+ * state_name_list_init() strdup()s each label, so these could have been
+ * built at runtime -- they are literals because they never vary, and a
+ * literal in flash costs no heap on a board that must not fragment it. */
+static const char SELFTEST_STATES[] =
+    "Passed\0"             /* 1 */
+    "Done, warning\0"      /* 2 */
+    "Failed\0"             /* 3 */
+    "In progress\0"        /* 4 */
+    "Aborted\0"            /* 5 */
+    "Scheduled\0"          /* 6  the other track's; we never emit it */
+    "Unknown\0"            /* 7  moved off 0 so every enum starts at 1 */
+    "\0";
+
+/* esp_reset_reason_t order, shifted by one in out_common's restart_reason().
+ * The enum is append-only upstream, so this list IS the table -- keep it in
+ * step with esp_system.h and nothing else needs touching. */
+static const char RESTART_STATES[] =
+    "Unknown\0"            /*  1  ESP_RST_UNKNOWN    */
+    "Power-on\0"           /*  2  ESP_RST_POWERON    */
+    "External pin\0"       /*  3  ESP_RST_EXT        */
+    "Software restart\0"   /*  4  ESP_RST_SW         */
+    "Panic\0"              /*  5  ESP_RST_PANIC      */
+    "Interrupt watchdog\0" /*  6  ESP_RST_INT_WDT    */
+    "Task watchdog\0"      /*  7  ESP_RST_TASK_WDT   */
+    "Other watchdog\0"     /*  8  ESP_RST_WDT        */
+    "Deep sleep\0"         /*  9  ESP_RST_DEEPSLEEP  */
+    "Brownout\0"           /* 10  ESP_RST_BROWNOUT   */
+    "SDIO\0"               /* 11  ESP_RST_SDIO       */
+    "USB peripheral\0"     /* 12  ESP_RST_USB        */
+    "JTAG\0"               /* 13  ESP_RST_JTAG       */
+    "eFuse error\0"        /* 14  ESP_RST_EFUSE      */
+    "Power glitch\0"       /* 15  ESP_RST_PWR_GLITCH */
+    "CPU lockup\0"         /* 16  ESP_RST_CPU_LOCKUP */
+    "\0";
+
+/* What each binary SAYS, instead of "Active" and "Inactive". Free -- bi.c
+ * already carries both properties -- and it is the difference between an
+ * operator reading a point and decoding one. These are literals in flash, so
+ * unlike the device object's name there is no lifetime question. */
+static const struct { const char *on, *off; } BI_TEXT[OUT_DISCRETE_N] = {
+    [OUT_D_ONLINE]                = { "Online",         "Not online"   },
+    [OUT_D_ON_BATTERY]            = { "On battery",     "On mains"     },
+    [OUT_D_LOW_BATTERY]           = { "Low",            "Normal"       },
+    [OUT_D_REPLACE_BATTERY]       = { "Replace",        "OK"           },
+    [OUT_D_OVERLOAD]              = { "Overloaded",     "Normal"       },
+    [OUT_D_COMM_OK]               = { "OK",             "Lost"         },
+    [OUT_D_AVR_BOOST]             = { "Boosting",       "Off"          },
+    [OUT_D_AVR_TRIM]              = { "Trimming",       "Off"          },
+    [OUT_D_CHARGING]              = { "Charging",       "Not charging" },
+    [OUT_D_BATTERY_AGE_ALARM]     = { "Overdue",        "OK"           },
+    [OUT_D_OUTPUT_NOT_PROTECTING] = { "Not protecting", "Protecting"   },
+};
 
 static uint8_t                       s_pdu[MAX_MPDU + 16];
 /* Set by the write callback, acted on by bac_task. NOT done inside the
@@ -205,6 +283,15 @@ static object_functions_t s_objects[] = {
       Analog_Input_Change_Of_Value, Analog_Input_Change_Of_Value_Clear,
       Analog_Input_Intrinsic_Reporting, NULL, NULL, Analog_Input_Create,
       Analog_Input_Delete, NULL, Analog_Input_Writable_Property_List },
+
+    { OBJECT_MULTI_STATE_INPUT, Multistate_Input_Init, Multistate_Input_Count,
+      Multistate_Input_Index_To_Instance, Multistate_Input_Valid_Instance,
+      Multistate_Input_Object_Name, Multistate_Input_Read_Property, NULL,
+      Multistate_Input_Property_Lists, NULL, NULL,
+      Multistate_Input_Encode_Value_List, Multistate_Input_Change_Of_Value,
+      Multistate_Input_Change_Of_Value_Clear, NULL, NULL, NULL,
+      Multistate_Input_Create, Multistate_Input_Delete, NULL,
+      Multistate_Input_Writable_Property_List },
 
     /* The only row with a write function, and it is ours rather than bv.c's
      * -- see bv_write(). Present-value still ends up in
@@ -279,6 +366,24 @@ static void create_objects(void)
         Binary_Input_Name_Set(inst, out_common_discrete_name(i));
         Binary_Input_Description_Set(inst, out_common_discrete_name(i));
         Binary_Input_Present_Value_Set(inst, BINARY_INACTIVE);
+        Binary_Input_Active_Text_Set(inst, BI_TEXT[i].on);
+        Binary_Input_Inactive_Text_Set(inst, BI_TEXT[i].off);
+    }
+
+    /* The enumerated registers. Write-disabled explicitly: these are inputs,
+     * and leaning on the object table's NULL write function alone would make
+     * that depend on a default inside vendored code. */
+    static const struct { int reg; const char *states; } MSI[] = {
+        { OUT_R_TEST_RESULT,  SELFTEST_STATES },
+        { OUT_R_RESET_REASON, RESTART_STATES  },
+    };
+    for (unsigned k = 0; k < sizeof MSI / sizeof MSI[0]; k++) {
+        const uint32_t inst = Multistate_Input_Create((uint32_t)MSI[k].reg + 1);
+        Multistate_Input_Name_Set(inst, out_common_reg_name(MSI[k].reg));
+        Multistate_Input_Description_Set(inst, out_common_reg_name(MSI[k].reg));
+        /* Sets Number_Of_States too: ms-input.c derives it from this list. */
+        Multistate_Input_State_Text_List_Set(inst, MSI[k].states);
+        Multistate_Input_Write_Disable(inst);
     }
     for (int a = 0; a < OUT_REG_N; a++) {
         if (!reg_is_bacnet_point(a)) continue;
@@ -349,6 +454,24 @@ static void refresh(void)
         }
         Analog_Input_Present_Value_Set(inst, (float)p.reg[a] / div);
         Analog_Input_Reliability_Set(inst, RELIABILITY_NO_FAULT_DETECTED);
+    }
+
+    /* The enumerated registers, published as their own value: both protocols
+     * number these the same, so there is no arithmetic here on purpose.
+     *
+     * 0 is not a state. Both encodings were made 1-based, so a zero means
+     * something upstream is wrong rather than "state zero" -- and an MSI has
+     * no way to say zero anyway. It reads as unavailable, like any other
+     * number we cannot stand behind. */
+    for (int a = 0; a < OUT_REG_N; a++) {
+        if (!reg_is_enum(a)) continue;
+        const uint32_t inst = (uint32_t)a + 1;
+        if (!p.reg_live[a] || p.reg[a] == OUT_ABSENT || p.reg[a] == 0) {
+            Multistate_Input_Reliability_Set(inst, RELIABILITY_COMMUNICATION_FAILURE);
+            continue;
+        }
+        Multistate_Input_Present_Value_Set(inst, p.reg[a]);
+        Multistate_Input_Reliability_Set(inst, RELIABILITY_NO_FAULT_DETECTED);
     }
 }
 
