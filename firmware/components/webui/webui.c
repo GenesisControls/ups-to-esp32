@@ -1369,11 +1369,24 @@ static esp_err_t post_ota_upload(httpd_req_t *req)
          ? cJSON_GetObjectItemCaseSensitive((root), (name))->valueint           \
          : (fallback))
 
-/* Applies one optional integer setting, stopping at the first refusal. */
+/* Applies one optional integer setting, stopping at the first refusal.
+ *
+ * The two failures are told apart on purpose. Every setter answers
+ * ESP_ERR_INVALID_ARG for a value out of range and passes anything else
+ * straight up from NVS, so reporting one message for both told a site its
+ * port must be 1-65535 when the port was 502 and the write had failed. The
+ * range message is now only ever shown when the range really was the
+ * problem. */
 #define BUS_SET(root, name, call, msg)                                         \
     do {                                                                       \
         const cJSON *jj = cJSON_GetObjectItemCaseSensitive((root), (name));    \
-        if (!why && cJSON_IsNumber(jj) && (call) != ESP_OK) why = (msg);        \
+        if (!why && cJSON_IsNumber(jj)) {                                      \
+            const esp_err_t e_ = (call);                                       \
+            if (e_ == ESP_ERR_INVALID_ARG) why = (msg);                        \
+            else if (e_ != ESP_OK)                                             \
+                why = "the value was accepted but could not be stored "        \
+                      "(settings memory). Try a factory reset.";               \
+        }                                                                      \
     } while (0)
 
 /* The bus settings. Which protocol is on the trunk, and everything a site

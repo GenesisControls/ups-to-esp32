@@ -342,13 +342,25 @@ static void load_settings(void)
     nvs_close(h);
 }
 
+/* THE SET RETURN IS CHECKED, not just the commit.
+ *
+ * It used not to be, here and in every writer below, and the failure that
+ * hides is nasty: nvs_set_*() refuses the write (no free entry, or a key
+ * stored once with a different type), nvs_commit() cheerfully succeeds
+ * because there is nothing to flush, the setter answers ESP_OK, the caller
+ * updates its RAM copy -- and the board behaves correctly until it reboots,
+ * when the setting is simply back to what it was. A site would have had to
+ * notice that a saved port did not survive a power cycle.
+ *
+ * It also makes webui's "could not be stored" message reachable for the right
+ * reason instead of being dead code. */
 static esp_err_t put_u8(const char *key, uint8_t v)
 {
     nvs_handle_t h;
     esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
     if (e != ESP_OK) return e;
-    nvs_set_u8(h, key, v);
-    e = nvs_commit(h);
+    e = nvs_set_u8(h, key, v);
+    if (e == ESP_OK) e = nvs_commit(h);
     nvs_close(h);
     return e;
 }
@@ -440,8 +452,8 @@ esp_err_t out_common_set_baud(int baud)
     nvs_handle_t h;
     esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
     if (e != ESP_OK) return e;
-    nvs_set_i32(h, KEY_BAUD, baud);
-    e = nvs_commit(h);
+    e = nvs_set_i32(h, KEY_BAUD, baud);
+    if (e == ESP_OK) e = nvs_commit(h);
     nvs_close(h);
     if (e == ESP_OK) s_baud = baud;
     return e;
@@ -456,10 +468,13 @@ static void bump_boots(void)
     uint16_t n = 0;
     nvs_get_u16(h, KEY_BOOTS, &n);
     if (n < OUT_REG_MAX_REAL) n++;
-    nvs_set_u16(h, KEY_BOOTS, n);
-    nvs_commit(h);
+    /* Register 17 must not report a count that was not stored, or a board
+     * with full settings memory would appear to reboot endlessly. */
+    esp_err_t e = nvs_set_u16(h, KEY_BOOTS, n);
+    if (e == ESP_OK) e = nvs_commit(h);
     nvs_close(h);
-    s_boots = n;
+    if (e == ESP_OK) s_boots = n;
+    else ESP_LOGW(TAG, "could not store the boot count: %s", esp_err_to_name(e));
 }
 
 esp_err_t out_common_init(void)
@@ -511,10 +526,16 @@ esp_err_t out_common_set_battery_date(const char *yyyy_mm_dd)
     nvs_handle_t h;
     esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
     if (e != ESP_OK) return e;
-    if (clear) { nvs_erase_key(h, KEY_BAT_DATE); s_bat_date[0] = '\0'; }
-    else       { nvs_set_str(h, KEY_BAT_DATE, yyyy_mm_dd);
-                 strlcpy(s_bat_date, yyyy_mm_dd, sizeof(s_bat_date)); }
-    e = nvs_commit(h);
+    if (clear) {
+        /* A key that was never there is not a failure. */
+        e = nvs_erase_key(h, KEY_BAT_DATE);
+        if (e == ESP_ERR_NVS_NOT_FOUND) e = ESP_OK;
+        if (e == ESP_OK) s_bat_date[0] = '\0';
+    } else {
+        e = nvs_set_str(h, KEY_BAT_DATE, yyyy_mm_dd);
+        if (e == ESP_OK) strlcpy(s_bat_date, yyyy_mm_dd, sizeof(s_bat_date));
+    }
+    if (e == ESP_OK) e = nvs_commit(h);
     nvs_close(h);
     return e;
 }
@@ -530,8 +551,8 @@ esp_err_t out_common_set_battery_life_years(int years)
     nvs_handle_t h;
     esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
     if (e != ESP_OK) return e;
-    nvs_set_i8(h, KEY_BAT_LIFE, (int8_t)years);
-    e = nvs_commit(h);
+    e = nvs_set_i8(h, KEY_BAT_LIFE, (int8_t)years);
+    if (e == ESP_OK) e = nvs_commit(h);
     nvs_close(h);
     if (e == ESP_OK) s_bat_life_years = years;
     return e;
@@ -542,8 +563,8 @@ esp_err_t out_common_set_hb_policy(out_hb_policy_t p)
     nvs_handle_t h;
     esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
     if (e != ESP_OK) return e;
-    nvs_set_u8(h, KEY_HB, p == OUT_HB_RUN ? 1 : 0);
-    e = nvs_commit(h);
+    e = nvs_set_u8(h, KEY_HB, p == OUT_HB_RUN ? 1 : 0);
+    if (e == ESP_OK) e = nvs_commit(h);
     nvs_close(h);
     if (e == ESP_OK) s_hb = p;
     return e;
@@ -559,8 +580,8 @@ esp_err_t out_common_set_device_id(uint32_t id)
     nvs_handle_t h;
     esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
     if (e != ESP_OK) return e;
-    nvs_set_u32(h, KEY_DEVID, id);
-    e = nvs_commit(h);
+    e = nvs_set_u32(h, KEY_DEVID, id);
+    if (e == ESP_OK) e = nvs_commit(h);
     nvs_close(h);
     if (e == ESP_OK) s_devid = id;
     return e;
@@ -586,14 +607,14 @@ esp_err_t out_common_set_max_master(int n)
     return e;
 }
 
-/* u16 helper: the network number and the two ports are all 16-bit. */
+/* u16 helper: the ports are 16-bit. Checks the set, as put_u8 explains. */
 static esp_err_t put_u16(const char *key, uint16_t v)
 {
     nvs_handle_t h;
     esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
     if (e != ESP_OK) return e;
-    nvs_set_u16(h, key, v);
-    e = nvs_commit(h);
+    e = nvs_set_u16(h, key, v);
+    if (e == ESP_OK) e = nvs_commit(h);
     nvs_close(h);
     return e;
 }

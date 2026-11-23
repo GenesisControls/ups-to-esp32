@@ -2275,11 +2275,17 @@ function busFields(){
     mstp ? '(MS/TP station address, 0 to 127)' : '(Modbus slave address, 1 to 247)';
 }
 let busBuilt=null;
+// Set once the card has been filled from the board, and never cleared --
+// busBuilt goes back to null after a save to force a re-read, and a Save
+// pressed in that gap must not be mistaken for "never loaded". Without this,
+// a board that cannot be polled leaves every box empty, and Save would post
+// those empties as zeros: the protocol select would read as its first option
+// and quietly take the trunk off the bus.
+let busLoaded=false;
 function busUI(b){
   const key=JSON.stringify([b.has485,b.ip,b.proto,b.tcp_en,b.address,b.baud,b.format,b.cmd,
                             b.devid_set,b.infofr,b.maxmast,b.mbport,b.tcpuid]);
   if(busBuilt!==key){
-    busBuilt=key;
     // A board with no transceiver cannot offer the two RS485 protocols. The
     // select itself stays, because BACnet/IP will live in it.
     for(const o of $('bus-proto').options){
@@ -2300,6 +2306,11 @@ function busUI(b){
     $('bus-mbport').value=String(b.mbport||502);
     $('bus-tcpuid').value=String(b.tcpuid===undefined?0:b.tcpuid);
     busFields();
+    /* Last, not first: marking the card built before filling it means one
+     * throw in the middle leaves it half-populated for good, because the key
+     * already matches and nothing retries. */
+    busBuilt=key;
+    busLoaded=true;
   }
   // What the device is actually using, which differs from the field whenever
   // the field says 0.
@@ -2405,17 +2416,42 @@ $('bus-reboot').onclick=async()=>{
 // The fields follow the controls at once, before any save.
 $('bus-proto').onchange=$('bus-tcp-en').onchange=()=>busFields();
 $('bus-save').onclick=async()=>{
-  const r=await api('/api/bus',{proto:+$('bus-proto').value,
-                                tcp_en:$('bus-tcp-en').checked,
-                                address:+$('bus-addr').value,
-                                baud:+$('bus-baud').value,
-                                format:+$('bus-fmt').value,
-                                devid:+$('bus-devid').value,
-                                infofr:+$('bus-infofr').value,
-                                maxmast:+$('bus-maxmast').value,
-                                mbport:+$('bus-mbport').value,
-                                tcpuid:+$('bus-tcpuid').value,
-                                cmd:$('bus-cmd').checked});
+  // WHAT GETS SENT, AND WHY NOT ALL OF IT.
+  //
+  // /api/bus changes only what it is sent, so a field left out keeps its
+  // stored value. Send everything regardless and a setting the chosen
+  // protocols do not even use still gets validated -- and a hidden box that
+  // never received a value reads as 0, which is legal for most of these and
+  // out of range for the TCP port. That is how saving an RS485-only board
+  // came back "the Modbus TCP port must be 1-65535" about a field the page
+  // was not showing.
+  //
+  // So: a setting goes out when its group is visible AND its box holds
+  // something. Everything else is the board's business, not this page's.
+  if(!busLoaded){ toast('still reading the board — try again in a moment'); return; }
+  const shown=g=>{ const el=$(g); return !!el && !el.hidden; };
+  const val=(id,group)=>{
+    if(!shown(group)) return undefined;
+    const v=$(id).value.trim();
+    if(v==='') return undefined;
+    const n=+v;
+    return Number.isFinite(n)?n:undefined;
+  };
+  // proto, tcp_en and cmd are the choice itself and are always sent; the rest
+  // describe one transport each.
+  const body={proto:+$('bus-proto').value,
+              tcp_en:$('bus-tcp-en').checked,
+              cmd:$('bus-cmd').checked};
+  const maybe={address:val('bus-addr','f-addr'),
+               baud:   val('bus-baud','f-baud'),
+               format: val('bus-fmt','f-fmt'),
+               devid:  val('bus-devid','f-devid'),
+               infofr: val('bus-infofr','f-mstp'),
+               maxmast:val('bus-maxmast','f-mstp'),
+               mbport: val('bus-mbport','f-mbport'),
+               tcpuid: val('bus-tcpuid','f-tcpuid')};
+  for(const k in maybe) if(maybe[k]!==undefined) body[k]=maybe[k];
+  const r=await api('/api/bus',body);
   if(!r.ok){ toast(r.error||'failed'); return; }
   busBuilt=null; toast('Saved — restart to apply'); poll();
 };

@@ -196,6 +196,18 @@ tells you how close you are.
 **Restart** — the button on the RS485 / BMS card, next to the settings that
 need one.
 
+### If a setting will not save
+
+> **“The value was accepted but could not be stored (settings memory).”**
+
+That is the board's settings memory refusing the write, not a bad value — the
+page has already checked the range. It means the memory is full or damaged, and
+a factory reset is the fix. A setting that appears to save and is back to its
+old value after a power cycle is the same fault caught later.
+
+A message naming a *range* instead (“must be 1–247”, “must be 1–65535”) is
+about the value you typed, and the range it gives is the answer.
+
 ---
 
 ## What this firmware does not do
