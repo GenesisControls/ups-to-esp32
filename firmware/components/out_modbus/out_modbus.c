@@ -36,6 +36,11 @@ static const char *TAG = "out_mb";
  * quick test is seconds of load on battery; one every half hour is generous
  * for any real use and useless as a way to flatten a pack. */
 #define CMD_MIN_GAP_US  (30LL * 60 * 1000000)
+
+/* 2.x asks for a response timeout per instance. This is how long the stack
+ * waits on its own internals, not how long a master waits for us; the default
+ * is fine and this is here to be explicit rather than to tune anything. */
+#define RESPONSE_TOUT_MS 1000
 #define REFRESH_MS      1000
 
 /* The register image the stack serves from. esp-modbus answers reads straight
@@ -59,7 +64,12 @@ static uint8_t  s_cmd;          /* the command coil's one byte */
 static int64_t  s_cmd_last_us;
 static out_modbus_stat_t s_stat;
 static SemaphoreHandle_t s_stat_lock;
-static void *s_handler;
+/* 2.x is handle-based: every call takes the context that created it, which
+ * is what makes an RTU slave and a TCP slave able to coexist at all. 1.x kept
+ * one global slave_interface_ptr and a second init silently replaced the
+ * first. Still ONE context here -- the two-instance split is its own change --
+ * but the plumbing is now per-instance. */
+static void *s_ctx;
 
 /* The contiguous blocks of the address map, with the reserved ranges left
  * OUT. This is how "a planned address answers exception 02" is enforced: an
@@ -164,7 +174,7 @@ static void mb_task(void *arg)
     TickType_t next = xTaskGetTickCount();
     for (;;) {
         /* Drain whatever the trunk has done since the last pass. */
-        mb_event_group_t ev = mbc_slave_check_event(
+        mb_event_group_t ev = mbc_slave_check_event(s_ctx,
             MB_EVENT_HOLDING_REG_WR | MB_EVENT_HOLDING_REG_RD |
             MB_EVENT_INPUT_REG_RD   | MB_EVENT_COILS_WR       |
             MB_EVENT_COILS_RD       | MB_EVENT_DISCRETE_RD);
@@ -183,12 +193,16 @@ static void mb_task(void *arg)
             }
             xSemaphoreGive(s_stat_lock);
             if (ev & MB_EVENT_COILS_WR) cmd_check();
-            if (ev & (MB_EVENT_HOLDING_REG_WR | MB_EVENT_COILS_WR)) {
-                /* The status coils and every register are read-only; only the
-                 * command coil above means anything, and cmd_check() has
-                 * already consumed it. */
-                refresh();                  /* put the status values back */
-            }
+            /* No put-the-values-back pass any more: the status areas are
+             * MB_ACCESS_RO, so a write to one never reaches our buffer.
+             *
+             * UNVERIFIED, and worth checking against a real master: whether
+             * 2.x still raises a _WR event for a write it refused itself. If
+             * it refuses before signalling, writes_refused above will read 0
+             * while writes are in fact being correctly rejected -- a worse
+             * counter but better behaviour on the wire, which is the right
+             * way round. The exception the master sees is the thing that
+             * matters, and the acceptance test checks that, not this. */
         }
 
         /* Roll the rate window, and sample the collision flag. The flag is
@@ -224,7 +238,7 @@ static void mb_task(void *arg)
 /* The register areas and the stack start. Identical for RTU and TCP -- the
  * point set does not care what carries it -- so this is shared rather than
  * written twice and left to drift. */
-static esp_err_t areas_and_start(void)
+static esp_err_t areas_and_start(void *ctx)
 {
     esp_err_t err;
 
@@ -237,25 +251,33 @@ static esp_err_t areas_and_start(void)
         mb_register_area_descriptor_t a = {
             .start_offset = blk->first,
             .type         = MB_PARAM_INPUT,
+            /* MB_ACCESS_RO is new in 2.x and it is what the data map always
+             * wanted: the STACK refuses a write and answers an exception,
+             * instead of the 1.x arrangement where a write landed in our
+             * buffer and refresh() put the real value back a moment later.
+             * That window is gone, and so is the deviation it forced us to
+             * document for the other track. */
+            .access       = MB_ACCESS_RO,
             .address      = &s_ireg[blk->first],
             .size         = (size_t)blk->count * sizeof(uint16_t),
         };
-        if ((err = mbc_slave_set_descriptor(a)) != ESP_OK) goto fail;
+        if ((err = mbc_slave_set_descriptor(ctx, a)) != ESP_OK) goto fail;
         a.type    = MB_PARAM_HOLDING;
         a.address = &s_hreg[blk->first];
-        if ((err = mbc_slave_set_descriptor(a)) != ESP_OK) goto fail;
+        if ((err = mbc_slave_set_descriptor(ctx, a)) != ESP_OK) goto fail;
     }
     {
         mb_register_area_descriptor_t d = {
             .start_offset = 0,
             .type         = MB_PARAM_DISCRETE,
+            .access       = MB_ACCESS_RO,
             .address      = s_disc,
             .size         = sizeof(s_disc),
         };
-        if ((err = mbc_slave_set_descriptor(d)) != ESP_OK) goto fail;
+        if ((err = mbc_slave_set_descriptor(ctx, d)) != ESP_OK) goto fail;
         d.type    = MB_PARAM_COIL;
         d.address = s_coil;
-        if ((err = mbc_slave_set_descriptor(d)) != ESP_OK) goto fail;
+        if ((err = mbc_slave_set_descriptor(ctx, d)) != ESP_OK) goto fail;
 
         /* The command coil, in its own area well away from the status block.
          * Registered whether or not commands are enabled, so a master gets a
@@ -264,13 +286,17 @@ static esp_err_t areas_and_start(void)
         mb_register_area_descriptor_t cm = {
             .start_offset = CMD_COIL_ADDR,
             .type         = MB_PARAM_COIL,
+            /* The ONE writable thing on this device, and it is writable only
+             * so cmd_check() can read what was written and then refuse it on
+             * its own terms. Everything else above is MB_ACCESS_RO. */
+            .access       = MB_ACCESS_RW,
             .address      = &s_cmd,
             .size         = sizeof(s_cmd),
         };
-        if ((err = mbc_slave_set_descriptor(cm)) != ESP_OK) goto fail;
+        if ((err = mbc_slave_set_descriptor(ctx, cm)) != ESP_OK) goto fail;
     }
 
-    if ((err = mbc_slave_start()) != ESP_OK) {
+    if ((err = mbc_slave_start(ctx)) != ESP_OK) {
         ESP_LOGE(TAG, "slave start: %s", esp_err_to_name(err));
         return err;
     }
@@ -295,29 +321,27 @@ static esp_err_t start_tcp(int addr)
         ESP_LOGE(TAG, "Modbus TCP needs the Wi-Fi station interface, which is not up");
         return ESP_ERR_INVALID_STATE;
     }
-    esp_err_t err = mbc_slave_init(MB_PORT_TCP_SLAVE, &s_handler);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "slave init (TCP): %s", esp_err_to_name(err));
-        return err;
-    }
-    /* mb_communication_info_t is a UNION: these are the TCP arm's fields, and
-     * the serial arm's must be left alone. ip_addr NULL accepts any client --
-     * the brief's allowed-client list is a later setting, and until it exists
-     * the honest position is that anything on that LAN can read this. */
+    /* ip_addr_table NULL accepts any client -- the brief's allowed-client
+     * list is a later setting, and until it exists the honest position is
+     * that anything on that LAN can read this. */
     const int port = out_common_mb_tcp_port();
     mb_communication_info_t comm = {
-        .ip_mode      = MB_MODE_TCP,
-        .slave_uid    = (uint8_t)addr,
-        .ip_port      = (uint16_t)port,
-        .ip_addr_type = MB_IPV4,
-        .ip_addr      = NULL,
-        .ip_netif_ptr = netif,
+        .tcp_opts = {
+            .mode             = MB_TCP,
+            .port             = (uint16_t)port,
+            .uid              = (uint8_t)addr,
+            .addr_type        = MB_IPV4,
+            .ip_addr_table    = NULL,
+            .ip_netif_ptr     = netif,
+            .response_tout_ms = RESPONSE_TOUT_MS,
+        },
     };
-    if ((err = mbc_slave_setup(&comm)) != ESP_OK) {
-        ESP_LOGE(TAG, "slave setup (TCP): %s", esp_err_to_name(err));
+    esp_err_t err = mbc_slave_create_tcp(&comm, &s_ctx);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "slave create (TCP): %s", esp_err_to_name(err));
         return err;
     }
-    if ((err = areas_and_start()) != ESP_OK) return err;
+    if ((err = areas_and_start(s_ctx)) != ESP_OK) return err;
 
     xSemaphoreTake(s_stat_lock, portMAX_DELAY);
     s_stat.running = true;
@@ -365,22 +389,29 @@ esp_err_t out_modbus_start(void)
                             : (fmt == OUT_FMT_8O1) ? UART_PARITY_ODD
                                                    : UART_PARITY_DISABLE;
 
-    esp_err_t err = mbc_slave_init(MB_PORT_SERIAL_SLAVE, &s_handler);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "slave init: %s", esp_err_to_name(err)); return err; }
-
+    /* 2.x carries the whole character format in the config, including stop
+     * bits -- which 1.x did not, and which forced a uart_set_stop_bits() call
+     * after the stack had the port. That workaround is gone. */
     mb_communication_info_t comm = {
-        .mode       = MB_MODE_RTU,
-        .slave_addr = (uint8_t)addr,
-        .port       = BOARD_RS485_UART,
-        .baudrate   = (uint32_t)baud,
-        .parity     = par,
+        .ser_opts = {
+            .mode             = MB_RTU,
+            .port             = BOARD_RS485_UART,
+            .uid              = (uint8_t)addr,
+            .baudrate         = (uint32_t)baud,
+            .data_bits        = UART_DATA_8_BITS,
+            .stop_bits        = (fmt == OUT_FMT_8N2) ? UART_STOP_BITS_2
+                                                     : UART_STOP_BITS_1,
+            .parity           = par,
+            .response_tout_ms = RESPONSE_TOUT_MS,
+        },
     };
-    if ((err = mbc_slave_setup(&comm)) != ESP_OK) {
-        ESP_LOGE(TAG, "slave setup: %s", esp_err_to_name(err));
+    esp_err_t err = mbc_slave_create_serial(&comm, &s_ctx);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "slave create (serial): %s", esp_err_to_name(err));
         return err;
     }
 
-    if ((err = areas_and_start()) != ESP_OK) return err;
+    if ((err = areas_and_start(s_ctx)) != ESP_OK) return err;
 
     /* After the stack has the UART. The driver-enable is the peripheral's own
      * RTS in half-duplex mode -- see board.h; keying it in software is a race
@@ -394,17 +425,6 @@ esp_err_t out_modbus_start(void)
         ESP_LOGE(TAG, "uart_set_mode RS485: %s", esp_err_to_name(err));
         return err;
     }
-    /* Stop bits are not in mb_communication_info_t, so esp-modbus leaves
-     * whatever the UART defaults to. Set them explicitly after the stack has
-     * the port, or an 8N2 master sees frame errors that look exactly like a
-     * wrong baud rate. */
-    if ((err = uart_set_stop_bits(BOARD_RS485_UART,
-                                  fmt == OUT_FMT_8N2 ? UART_STOP_BITS_2
-                                                     : UART_STOP_BITS_1)) != ESP_OK) {
-        ESP_LOGE(TAG, "uart_set_stop_bits: %s", esp_err_to_name(err));
-        return err;
-    }
-
     xSemaphoreTake(s_stat_lock, portMAX_DELAY);
     s_stat.running = true;
     s_stat.address = addr;
