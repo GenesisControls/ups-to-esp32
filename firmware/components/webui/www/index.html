@@ -642,11 +642,8 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
           <option value="1">nothing</option>
           <option value="2">Modbus RTU (RS485)</option>
           <option value="3">BACnet MS/TP (RS485)</option>
-          <option value="4" disabled>BACnet/IP &mdash; not in this firmware yet</option>
         </select>
-        <p class="note" id="bus-proto-note">One at a time. Modbus RTU and BACnet MS/TP share the
-          RS485 pair; BACnet MS/TP and BACnet/IP share the BACnet stack&rsquo;s single
-          datalink.</p>
+        <p class="note" id="bus-proto-note">One at a time &mdash; they share the RS485 pair.</p>
       </div>
 
       <div id="f-ipouts">
@@ -704,12 +701,6 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
           to 127.</p>
       </div>
 
-      <div id="f-bnet">
-        <label for="bus-bnet">BACnet network <span class="note">(0 to 65534)</span></label>
-        <input id="bus-bnet" inputmode="numeric" autocomplete="off">
-        <p class="note">0 means not configured, which is right for a flat site. It matters when a
-          BACnet router joins segments.</p>
-      </div>
 
       <div id="f-mbport">
         <label for="bus-mbport">TCP port</label>
@@ -718,12 +709,6 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
           and you must tell the BMS &mdash; nothing discovers a non-standard port.</p>
       </div>
 
-      <div id="f-bipport">
-        <label for="bus-bipport">UDP port</label>
-        <input id="bus-bipport" inputmode="numeric" autocomplete="off">
-        <p class="note">47808 (0xBAC0) is the registered BACnet/IP port. Change it and you must
-          tell the BMS.</p>
-      </div>
 
       <div id="f-cmd">
         <label class="chk"><input type="checkbox" id="bus-cmd"> allow a battery self-test to be started from the bus</label>
@@ -2256,20 +2241,18 @@ if($('fwup-go')) $('fwup-go').onclick=async()=>{
 //
 // Driven by the live controls, not the saved settings, so the fields follow a
 // choice immediately rather than after a save and a restart.
-const BUS_GROUPS=['f-addr','f-devid','f-fmt','f-baud','f-mstp','f-bnet','f-mbport','f-bipport','f-cmd'];
+const BUS_GROUPS=['f-addr','f-devid','f-fmt','f-baud','f-mstp','f-mbport','f-cmd'];
 function busFields(){
   const t=+$('bus-proto').value||1, tcp=$('bus-tcp-en').checked;
-  const rtu=t===2, mstp=t===3, bip=t===4;
+  const rtu=t===2, mstp=t===3;
   const on={
-    'f-addr'   : rtu||mstp||tcp,   // the station address, shared
-    'f-baud'   : rtu||mstp,        // serial only
-    'f-fmt'    : rtu,              // MS/TP is 8N1 by standard
-    'f-mstp'   : mstp,             // token passing
-    'f-devid'  : mstp||bip,        // BACnet identity
-    'f-bnet'   : bip,
-    'f-mbport' : tcp,
-    'f-bipport': bip,
-    'f-cmd'    : rtu||tcp,         // coil 100 is Modbus; BACnet has no equivalent
+    'f-addr'  : rtu||mstp||tcp,    // the station address, shared
+    'f-baud'  : rtu||mstp,         // serial only
+    'f-fmt'   : rtu,               // MS/TP is 8N1 by standard
+    'f-mstp'  : mstp,              // token passing
+    'f-devid' : mstp,              // BACnet identity
+    'f-mbport': tcp,
+    'f-cmd'   : rtu||tcp,          // coil 100 is Modbus; BACnet has no equivalent
   };
   for(const g of BUS_GROUPS){ const el=$(g); if(el) el.hidden=!on[g]; }
 
@@ -2285,7 +2268,7 @@ function busFields(){
 let busBuilt=null;
 function busUI(b){
   const key=JSON.stringify([b.has485,b.ip,b.proto,b.tcp_en,b.address,b.baud,b.format,b.cmd,
-                            b.devid_set,b.infofr,b.maxmast,b.bacnet_net,b.mbport,b.bipport]);
+                            b.devid_set,b.infofr,b.maxmast,b.mbport]);
   if(busBuilt!==key){
     busBuilt=key;
     // A board with no transceiver cannot offer the two RS485 protocols. The
@@ -2305,9 +2288,7 @@ function busUI(b){
     $('bus-devid').value=String(b.devid_set===undefined?0:b.devid_set);
     $('bus-infofr').value=String(b.infofr||1);
     $('bus-maxmast').value=String(b.maxmast===undefined?127:b.maxmast);
-    $('bus-bnet').value=String(b.bacnet_net||0);
     $('bus-mbport').value=String(b.mbport||502);
-    $('bus-bipport').value=String(b.bipport||47808);
     busFields();
   }
   // What the device is actually using, which differs from the field whenever
@@ -2419,9 +2400,7 @@ $('bus-save').onclick=async()=>{
                                 devid:+$('bus-devid').value,
                                 infofr:+$('bus-infofr').value,
                                 maxmast:+$('bus-maxmast').value,
-                                bacnet_net:+$('bus-bnet').value,
                                 mbport:+$('bus-mbport').value,
-                                bipport:+$('bus-bipport').value,
                                 cmd:$('bus-cmd').checked});
   if(!r.ok){ toast(r.error||'failed'); return; }
   busBuilt=null; toast('Saved — restart to apply'); poll();

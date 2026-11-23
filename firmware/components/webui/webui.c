@@ -399,8 +399,7 @@ static esp_err_t get_status(httpd_req_t *req)
                   "\"has485\":%s,\"ip\":%s,"
                   "\"address\":%d,\"baud\":%d,\"format\":%d,\"cmd\":%s,"
                   "\"devid\":%lu,\"devid_set\":%lu,\"devname\":\"%s\","
-                  "\"infofr\":%d,\"maxmast\":%d,\"bacnet_net\":%d,"
-                  "\"mbport\":%d,\"bipport\":%d",
+                  "\"infofr\":%d,\"maxmast\":%d,\"mbport\":%d",
                   (int)out_common_proto(),
                   out_common_tcp_enabled() ? "true" : "false",
                   BOARD_HAS_RS485 ? "true" : "false",
@@ -412,8 +411,7 @@ static esp_err_t get_status(httpd_req_t *req)
                   (unsigned long)out_common_device_id(),
                   jesc(bac.device_name, e1, sizeof(e1)),
                   out_common_info_frames(), out_common_max_master(),
-                  out_common_bacnet_net(),
-                  out_common_mb_tcp_port(), out_common_bip_port());
+                  out_common_mb_tcp_port());
 
         /* Modbus RTU on the trunk. collisions and the per-access read counts
          * live here because they are serial facts. */
@@ -1420,11 +1418,11 @@ static esp_err_t post_bus(httpd_req_t *req)
          * old shape, where this field held every protocol. */
         why = "the protocol must be Modbus RTU, BACnet MS/TP, BACnet/IP or none";
     } else if (want_proto == OUT_PROTO_BACNET_IP) {
-        /* In the selector, served by nothing: out_bacnet compiles BACDL_MSTP
-         * only. Its settings are stored and validated so the datalink needs
-         * no second settings pass, but selecting it would leave the board
-         * silent while the page named a protocol. */
-        why = "BACnet/IP is not in this firmware yet";
+        /* Out of scope for this board, decided 2026-11-22, so this is a
+         * final answer rather than a "not yet": no BIP datalink is compiled
+         * and none is planned here. The enum member survives only for
+         * out_common_proto_name() and the NVS migration path. */
+        why = "this firmware does not serve BACnet/IP";
     } else if ((want_proto == OUT_PROTO_MODBUS_RTU ||
                 want_proto == OUT_PROTO_BACNET_MSTP) && !BOARD_HAS_RS485) {
         why = "this board has no RS485 transceiver";
@@ -1464,12 +1462,8 @@ static esp_err_t post_bus(httpd_req_t *req)
             "max info frames must be 1-255");
     BUS_SET(root, "maxmast", out_common_set_max_master(jj->valueint),
             "max master must be 0-127");
-    BUS_SET(root, "bacnet_net", out_common_set_bacnet_net(jj->valueint),
-            "the BACnet network number must be 0-65534");
     BUS_SET(root, "mbport", out_common_set_mb_tcp_port(jj->valueint),
             "the Modbus TCP port must be 1-65535");
-    BUS_SET(root, "bipport", out_common_set_bip_port(jj->valueint),
-            "the BACnet/IP port must be 1-65535");
 
     const cJSON *jc = cJSON_GetObjectItemCaseSensitive(root, "cmd");
     if (!why && cJSON_IsBool(jc) &&

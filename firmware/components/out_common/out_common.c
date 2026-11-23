@@ -32,11 +32,8 @@ static const char *TAG = "outcom";
 #define KEY_DEVID       "oc_devid"
 #define KEY_INFOFR      "oc_infofr"
 #define KEY_MAXMAST     "oc_maxmast"
-#define KEY_BACNET      "oc_bacnet"
 #define KEY_MBPORT      "oc_mbport"
-#define KEY_BIPPORT     "oc_bipport"
 #define KEY_TCPEN       "oc_tcpen"
-#define KEY_BIPEN       "oc_bipen"
 
 /* Comm-OK's threshold. The other track's README specifies 10 s, and upstream
  * independently arrives at the same number: FAILURES_BEFORE_RESET (5) polls
@@ -67,9 +64,7 @@ static bool              s_cmd_enabled = true;   /* self-test from the bus */
 static uint32_t          s_devid = OUT_DEVID_DERIVE;
 static int               s_info_frames = OUT_INFOFRAMES_DEFAULT;
 static int               s_max_master = OUT_MAXMASTER_DEFAULT;
-static int               s_bacnet_net = OUT_BACNET_NET_DEFAULT;
 static int               s_mb_tcp_port = OUT_MB_TCP_PORT_DEFAULT;
-static int               s_bip_port = OUT_BIP_PORT_DEFAULT;
 
 /* ---- helpers ---------------------------------------------------------- */
 
@@ -281,28 +276,41 @@ static void load_settings(void)
     if (nvs_get_i8(h, KEY_BAT_LIFE, &life) == ESP_OK) s_bat_life_years = life;
     uint8_t hb = 0;
     if (nvs_get_u8(h, KEY_HB, &hb) == ESP_OK) s_hb = hb ? OUT_HB_RUN : OUT_HB_INVALID;
-    /* KEY_PROTO holds the primary protocol. Two generations of stored value
-     * have to survive here:
+    /* KEY_PROTO holds the RS485 protocol. It has held other things:
      *
-     *   - Before 2026-11-22 it held ONE protocol for the whole device, so it
-     *     can contain 4 (Modbus TCP), which is not a primary protocol now and
-     *     becomes the TCP toggle instead.
-     *   - Briefly after that it was a trunk-only value with BACnet/IP living
-     *     in KEY_BIPEN. That key is folded back in below.
+     *   - Before 2026-11-22 it was ONE protocol for the whole device, so it
+     *     can contain 4 (Modbus TCP), which is not an RS485 protocol and
+     *     becomes the TCP toggle instead. Discarding it would silently
+     *     unconfigure a commissioned board.
+     *   - 5 (BACnet/IP) is possible in principle and serves nothing now, so
+     *     it loads as "nothing selected" -- see the case below.
      *
-     * Discarding either would silently unconfigure a commissioned board. */
+     * An older oc_bipen key may also still be in NVS from a brief period
+     * when BACnet/IP was a separate toggle. It is deliberately not read:
+     * nothing serves BACnet/IP, so honouring it could only produce the silent
+     * dead state this function exists to avoid. It rots harmlessly. */
     uint8_t pr = 0;
     if (nvs_get_u8(h, KEY_PROTO, &pr) == ESP_OK) {
         switch (pr) {
         case OUT_PROTO_NONE:
         case OUT_PROTO_MODBUS_RTU:
         case OUT_PROTO_BACNET_MSTP:
-        case OUT_PROTO_BACNET_IP:
             s_proto = (out_proto_t)pr;
             break;
         case OUT_PROTO_MODBUS_TCP:
             s_proto = OUT_PROTO_NONE;
             s_tcp_en = true;
+            break;
+        case OUT_PROTO_BACNET_IP:
+            /* No output serves this now, so loading it would leave the board
+             * silent while the page named a protocol -- the exact failure
+             * every refusal in post_bus exists to prevent. It becomes
+             * "nothing selected", which is visible and recoverable.
+             *
+             * No board should have it stored: it was refused at the API from
+             * the day the value existed. This is for the one that somehow
+             * does. */
+            s_proto = OUT_PROTO_NONE;
             break;
         default:
             break;                  /* corrupt: keep the default */
@@ -310,13 +318,6 @@ static void load_settings(void)
     }
     uint8_t te = 0;
     if (nvs_get_u8(h, KEY_TCPEN, &te) == ESP_OK) s_tcp_en = te != 0;
-    /* The short-lived separate BACnet/IP toggle, folded into the selector.
-     * It could never be set to true through the page (post_bus refused it),
-     * so this is for completeness rather than a case anyone has hit. */
-    uint8_t be = 0;
-    if (nvs_get_u8(h, KEY_BIPEN, &be) == ESP_OK && be) {
-        s_proto = OUT_PROTO_BACNET_IP;
-    }
     uint8_t ad = 0;
     if (nvs_get_u8(h, KEY_ADDR, &ad) == ESP_OK && ad >= 1 && ad <= 127) s_addr = ad;
     int32_t bd = 0;
@@ -332,12 +333,8 @@ static void load_settings(void)
     if (nvs_get_u8(h, KEY_INFOFR, &ifr) == ESP_OK && ifr >= 1) s_info_frames = ifr;
     uint8_t mm = 0;
     if (nvs_get_u8(h, KEY_MAXMAST, &mm) == ESP_OK && mm <= 127) s_max_master = mm;
-    uint16_t bn = 0;
-    if (nvs_get_u16(h, KEY_BACNET, &bn) == ESP_OK && bn <= 65534) s_bacnet_net = bn;
     uint16_t mp = 0;
     if (nvs_get_u16(h, KEY_MBPORT, &mp) == ESP_OK && mp >= 1) s_mb_tcp_port = mp;
-    uint16_t bp = 0;
-    if (nvs_get_u16(h, KEY_BIPPORT, &bp) == ESP_OK && bp >= 1) s_bip_port = bp;
     nvs_close(h);
 }
 
@@ -356,11 +353,15 @@ out_proto_t out_common_proto(void) { return s_proto; }
 
 esp_err_t out_common_set_proto(out_proto_t p)
 {
-    /* One of the three primary protocols, or nothing. Modbus TCP is not a
-     * value here -- it is its own switch, because it runs alongside these
-     * rather than instead of them. */
+    /* RS485, or nothing. Modbus TCP is not a value here -- it is its own
+     * switch, because it runs alongside these rather than instead of them.
+     *
+     * BACnet/IP is not a value either. Decided 2026-11-22: out of scope for
+     * this board, which exists to put a USB UPS on an RS485 trunk. The enum
+     * member stays for out_common_proto_name() and for the NVS migration
+     * path, but nothing can store it. */
     if (p != OUT_PROTO_NONE && p != OUT_PROTO_MODBUS_RTU &&
-        p != OUT_PROTO_BACNET_MSTP && p != OUT_PROTO_BACNET_IP) {
+        p != OUT_PROTO_BACNET_MSTP) {
         return ESP_ERR_INVALID_ARG;
     }
     esp_err_t e = put_u8(KEY_PROTO, (uint8_t)p);
@@ -588,18 +589,6 @@ static esp_err_t put_u16(const char *key, uint16_t v)
     return e;
 }
 
-int out_common_bacnet_net(void) { return s_bacnet_net; }
-
-esp_err_t out_common_set_bacnet_net(int n)
-{
-    /* 65535 is reserved for a broadcast to all networks, so a device may not
-     * sit on it. */
-    if (n < 0 || n > 65534) return ESP_ERR_INVALID_ARG;
-    esp_err_t e = put_u16(KEY_BACNET, (uint16_t)n);
-    if (e == ESP_OK) s_bacnet_net = n;
-    return e;
-}
-
 int out_common_mb_tcp_port(void) { return s_mb_tcp_port; }
 
 esp_err_t out_common_set_mb_tcp_port(int port)
@@ -607,16 +596,6 @@ esp_err_t out_common_set_mb_tcp_port(int port)
     if (port < 1 || port > 65535) return ESP_ERR_INVALID_ARG;
     esp_err_t e = put_u16(KEY_MBPORT, (uint16_t)port);
     if (e == ESP_OK) s_mb_tcp_port = port;
-    return e;
-}
-
-int out_common_bip_port(void) { return s_bip_port; }
-
-esp_err_t out_common_set_bip_port(int port)
-{
-    if (port < 1 || port > 65535) return ESP_ERR_INVALID_ARG;
-    esp_err_t e = put_u16(KEY_BIPPORT, (uint16_t)port);
-    if (e == ESP_OK) s_bip_port = port;
     return e;
 }
 

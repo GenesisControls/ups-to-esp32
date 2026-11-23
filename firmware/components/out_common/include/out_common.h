@@ -218,26 +218,18 @@ esp_err_t out_common_set_info_frames(int n);
 int       out_common_max_master(void);
 esp_err_t out_common_set_max_master(int n);
 
-/* The BACnet network number this device sits on. 0 means "not configured",
- * which is right for a flat site; it matters when a BACnet router joins
- * segments and the BMS needs to know which network a device is reached
- * through. */
-#define OUT_BACNET_NET_DEFAULT 0
-int       out_common_bacnet_net(void);
-esp_err_t out_common_set_bacnet_net(int n);
-
-/* ---- the IP ports ------------------------------------------------------
+/* The Modbus TCP port. Changeable because a site running two devices behind
+ * one NAT, or with its own firewall policy, has no other way out. Changing it
+ * means telling the BMS: nothing discovers a non-standard port by itself.
  *
- * Both default to their registered numbers and both are changeable, because
- * a site that runs two BACnet or two Modbus devices behind one NAT, or whose
- * firewall policy differs, has no other way out. Changing either means
- * telling the BMS: nothing discovers a non-standard port by itself. */
+ * There is deliberately no BACnet/IP port and no BACnet network number here.
+ * Both existed briefly and were read by nothing; BACnet/IP is out of scope
+ * for this board (2026-11-22), and a settings field that has no effect is
+ * worse than a missing one -- somebody eventually sets it and waits for
+ * something to happen. */
 #define OUT_MB_TCP_PORT_DEFAULT 502
-#define OUT_BIP_PORT_DEFAULT    47808
 int       out_common_mb_tcp_port(void);
 esp_err_t out_common_set_mb_tcp_port(int port);
-int       out_common_bip_port(void);
-esp_err_t out_common_set_bip_port(int port);
 
 /* What register 6 does when the UPS link is lost. */
 typedef enum {
