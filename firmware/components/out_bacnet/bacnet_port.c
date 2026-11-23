@@ -57,6 +57,13 @@ void mstimer_init(void)
 
 /* ---- the RS485 byte pipe --------------------------------------------- */
 
+/* NOTHING IN BACNET-STACK CALLS THIS.
+ *
+ * It fills in struct dlmstp_rs485_driver::init, which reads like the stack's
+ * way of bringing the hardware up -- and the stack never calls it. Not from
+ * dlmstp_init(), not from anywhere in src/. out_bacnet_start() calls it
+ * directly, and must: see the comment there for what a board does when this
+ * never runs, which is not "BACnet stays quiet". */
 void bacnet_rs485_init(void)
 {
     const uart_config_t cfg = {
@@ -103,7 +110,25 @@ void bacnet_rs485_init(void)
 
 void bacnet_rs485_send(const uint8_t *payload, uint16_t len)
 {
-    if (!s_up || !payload || len == 0) return;
+    if (!s_up || !payload || len == 0) {
+        /* Reset the silence timer even on the path that sends nothing.
+         *
+         * MS/TP's every timeout is measured as "how long has the line been
+         * quiet", and dlmstp_receive() runs the master state machine in a
+         * `while (MSTP_Master_Node_FSM(port))` loop that only ends when the
+         * machine has a timer left to wait on. A send that neither puts bytes
+         * on the wire nor moves the silence timer leaves every timeout
+         * permanently expired, so every transition is a "fast" one and that
+         * loop never returns -- which is a spin inside datalink_receive(),
+         * not a quiet bus.
+         *
+         * Our caller cannot yield while that happens, so the idle task
+         * starves and the watchdog reboots the board. Two lines of agreement
+         * with the state machine are cheaper than depending on the UART never
+         * failing. */
+        bacnet_rs485_silence_reset();
+        return;
+    }
 
     s_transmitting = true;
     uart_write_bytes(BOARD_RS485_UART, (const char *)payload, len);
@@ -160,6 +185,11 @@ void bacnet_rs485_silence_reset(void)
 {
     mstimer_set(&s_silence, 0);
 }
+
+/* Whether the UART is actually up. The stack has no way to ask and no way to
+ * report it, so out_bacnet_start() checks this itself and refuses to start
+ * the datalink without it. */
+bool bacnet_rs485_up(void) { return s_up; }
 
 uint32_t bacnet_rs485_bytes_tx(void) { return s_bytes_tx; }
 uint32_t bacnet_rs485_bytes_rx(void) { return s_bytes_rx; }

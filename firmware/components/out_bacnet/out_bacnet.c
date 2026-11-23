@@ -414,7 +414,28 @@ esp_err_t out_bacnet_start(void)
     create_objects();
     refresh();
 
+    /* BRING THE UART UP OURSELVES, AND REFUSE TO GO ON WITHOUT IT.
+     *
+     * s_driver.init is set to bacnet_rs485_init, which looks like enough and
+     * is not: nothing in bacnet-stack ever calls driver->init. Without this
+     * call the UART is never configured, every read and send is a no-op, and
+     * the master state machine -- which measures everything in line silence
+     * -- finds every timeout permanently expired and transitions forever
+     * inside dlmstp_receive(). That is a spin in our task, so the idle task
+     * starves and the watchdog reboots the board. Selecting BACnet MS/TP took
+     * a board off the network that way, every boot, until this was found.
+     *
+     * baud_set first: before the UART exists it only records the rate, and
+     * bacnet_rs485_init() is what applies it through uart_param_config. */
     bacnet_rs485_baud_set((uint32_t)baud);
+    bacnet_rs485_init();
+    if (!bacnet_rs485_up()) {
+        /* Fail closed. main() does not ESP_ERROR_CHECK this, so the board
+         * keeps serving its page and somebody can read why the trunk is
+         * silent -- which beats a reboot loop with no way in. */
+        ESP_LOGE(TAG, "RS485 did not come up; not starting the MS/TP datalink");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     const int info_frames = out_common_info_frames();
     const int max_master   = out_common_max_master();
@@ -475,10 +496,13 @@ esp_err_t out_bacnet_start(void)
     strlcpy(s_stat.device_name, dev_name, sizeof(s_stat.device_name));
     xSemaphoreGive(s_stat_lock);
 
-    /* 4096: the MS/TP state machine plus an APDU decode. MAX_APDU is 480 and
-     * the PDU buffer above is static rather than on this stack for that
-     * reason. */
-    if (xTaskCreate(bac_task, "out_bac", 4096, NULL, 4, NULL) != pdPASS) {
+    /* 8192: the MS/TP state machine plus a full APDU decode. The PDU buffer
+     * is static rather than on this stack, but ReadPropertyMultiple decodes
+     * into BACNET_APPLICATION_DATA_VALUE locals down a deep call chain, and
+     * 4096 left no margin for a request we have never seen on hardware. A
+     * stack overflow here is a panic, and a panic here is a board that drops
+     * off the network -- the cheap side of that trade is obvious. */
+    if (xTaskCreate(bac_task, "out_bac", 8192, NULL, 4, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
 

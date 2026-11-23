@@ -20,6 +20,10 @@ extern "C" {
  * dlmstp_init(); the driver struct points at it as .init so the datalink does
  * that itself. */
 void     bacnet_rs485_init(void);
+/* True once the UART is configured and installed. bacnet_rs485_init() reports
+ * failure only in the log, because the stack's driver struct wants a void
+ * init; this is how a caller finds out. */
+bool     bacnet_rs485_up(void);
 
 /* Sends a whole frame and blocks until the last bit has left the shift
  * register, because MS/TP's inter-frame timing starts there and not when the
