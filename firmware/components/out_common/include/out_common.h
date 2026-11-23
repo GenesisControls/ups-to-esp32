@@ -81,11 +81,31 @@ enum {                          /* input registers (FC4), mirrored as holding */
      * to the shared map and the brief says not to take one without going
      * through the other track -- this needs relaying, not assuming. */
     OUT_R_BEEPER,
-    /* 13-15 reserved for further UPS facts */
+    /* 13: what the UPS is DOING, in one point -- see out_common.c for how it
+     * is decided and why "on battery" beats a running test. Claimed from the
+     * reserved range on 2026-11-23 alongside 12; both need relaying. */
+    OUT_R_UPS_STATE,
+    /* 14-15 reserved for further UPS facts */
     OUT_R_FW_VERSION = 16,
     OUT_R_RESET_COUNT,
     OUT_R_RESET_REASON,
     /* 19-23 reserved for further adapter facts */
+};
+
+/* Register 13's states. 1-based, like every enumeration here, so the number
+ * is the same on Modbus and BACnet.
+ *
+ * NORMAL is deliberately the only "nothing to see here" value: every case
+ * the rules below do not cover lands on UNKNOWN rather than on NORMAL,
+ * because a summary point that reports calm when it cannot tell is the one
+ * failure this point must not have. */
+enum {
+    OUT_STATE_NORMAL = 1,       /* online, battery idle                      */
+    OUT_STATE_SELF_TEST,        /* online AND discharging: a test, not a cut */
+    OUT_STATE_CALIBRATING,      /* the UPS reports CAL: the deep test        */
+    OUT_STATE_ON_BATTERY,       /* the mains actually failed                 */
+    OUT_STATE_NOT_PROTECTING,   /* OFF or bypass: the load is not on the UPS */
+    OUT_STATE_UNKNOWN,          /* readable, but nothing above fits          */
 };
 
 /* THE PROTOCOLS THIS FIRMWARE KNOWS BY NAME.

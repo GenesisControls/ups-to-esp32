@@ -77,6 +77,7 @@ protected load from an unprotected one.
 | 10 | Input transfer low | V × 10 | the UPS does not report the window |
 | 11 | Input transfer high | V × 10 | the UPS does not report the window |
 | 12 | Beeper | enum below | this UPS has no controllable alarm, or comm lost |
+| 13 | **UPS state** | enum below | comm lost |
 | | *— 16–23 describe the adapter —* | | |
 | 16 | Firmware version | major×100 + minor | never |
 | 17 | Restart counter | count | never |
@@ -168,7 +169,47 @@ to publish. What makes it sound is already on the bus: discretes 1–4.
 > to the shared map, so this needs relaying to `ups-modbus-monitoring` rather
 > than assuming. 13–15 remain reserved.
 
-### Reserved addresses — 13–15 and 19–23
+#### Register 13 — UPS state
+
+**The one point to watch, if you only wire one.**
+
+| Value | Meaning | True when |
+|---|---|---|
+| 1 | Normal | online, battery idle |
+| 2 | **Self-test running** | online **and** discharging |
+| 3 | Calibration running | the UPS reports `CAL` — the deep test |
+| 4 | **On battery** | the mains actually failed |
+| 5 | Not protecting | `OFF` or bypass: the load is not on the UPS |
+| 6 | Unknown | readable, but none of the above fits |
+| 65535 | comm lost *(Reliability on BACnet)* |  |
+
+Everything in it is already on the bus as separate discretes. That is the
+point: **the combination that matters is not obvious.** A self-test is
+`Online` *and* discharging — the UPS stays Online because the mains never
+failed, and it is right to, or every site would raise a false mains-failure
+alarm each time a test ran. The cost is that from the bus a running test has
+looked identical to an idle UPS. State 2 is what tells them apart.
+
+**State 3 depends on the unit.** `CAL` means *performing a runtime
+calibration* and nothing else, so it is the only place in the whole stack
+where a deep test is distinguishable from a quick one — the self-test result
+register carries one *in progress* with no type. A UPS that never sets `CAL`
+simply never reaches state 3, and its deep test reads as state 2.
+
+**Worst wins.** More than one condition is true more often than not, and the
+order is: on battery → not protecting → calibration → self-test → normal. On
+battery beats any test deliberately: if the mains fails while a calibration
+is running, the site is in a real outage and this point says so rather than
+go on reporting a test.
+
+**Nothing unexplained lands on Normal.** Anything readable that does not fit
+the rules reads 6, not 1 — a summary point that reports calm when it cannot
+tell is the one failure it must not have.
+
+> **Claimed from the reserved range on 2026-11-23**, alongside register 12.
+> Both need relaying to `ups-modbus-monitoring`. 14–15 remain reserved.
+
+### Reserved addresses — 14–15 and 19–23
 
 These are **not** 65535. They are not registered in the datastore at all, so
 reading one returns **Modbus exception 02 (illegal data address)**.
@@ -178,7 +219,7 @@ that point and cannot read it right now*, exception 02 means *that point does
 not exist on this device*. A commissioning engineer who sees 02 has a typo or
 a point sheet from the wrong version; one who sees 65535 has a UPS question.
 
-Registers 13–15 and 19–23 are reserved for future UPS and adapter facts
+Registers 14–15 and 19–23 are reserved for future UPS and adapter facts
 respectively. Don't claim one without going through the other track.
 
 ### Comm-loss behaviour, exactly
@@ -254,6 +295,7 @@ point — see the end of this section.
 | BI10 | Battery age alarm | | AI11 | Input transfer low (V) |
 | BI11 | Output not protecting | | AI12 | Input transfer high (V) |
 | | | | **MSI13** | Beeper |
+| | | | **MSI14** | **UPS state** |
 | | | | AI17 | Firmware version |
 | | | | AI18 | Restart counter |
 | | | | **MSI19** | Last restart reason |
@@ -262,7 +304,7 @@ point — see the end of this section.
 whose value is `0b101101` is a Modbus workaround, not data — every bit of it
 is already BI1–BI6.
 
-**MSI10, MSI13 and MSI19 are Multi-State Inputs, not Analog Inputs**, because they
+**MSI10, MSI13, MSI14 and MSI19 are Multi-State Inputs, not Analog Inputs**, because they
 are enumerations rather than measurements. Each state carries its text, so a
 BMS shows `Task watchdog` where an AI could only show `7.0`. Multi-State
 Input is a different object type from Analog Input, so the instance rule is

@@ -258,6 +258,42 @@ static void build(out_points_t *p)
                             d.beeper >= 1 && d.beeper <= 3)
                                ? (uint16_t)d.beeper : OUT_ABSENT;
 
+    /* Register 13. ONE POINT FOR "WHAT IS THIS UPS DOING".
+     *
+     * Everything in it is already on the bus as separate discretes, and that
+     * is exactly the problem: the combination that matters is not obvious. A
+     * self-test is ONLINE *and* discharging, because the mains never failed
+     * and the UPS never claims otherwise -- so from the bus a running test
+     * has looked identical to an idle UPS. This is the point that tells them
+     * apart.
+     *
+     * EVALUATED WORST FIRST, because more than one is true more often than
+     * not. On battery beats any test: if the mains fails while a calibration
+     * is running, the site is in a real outage and this must say so rather
+     * than go on reporting a test. */
+    if (!ok) {
+        p->reg[OUT_R_UPS_STATE] = OUT_ABSENT;
+    } else if (p->discrete[OUT_D_ON_BATTERY]) {
+        p->reg[OUT_R_UPS_STATE] = OUT_STATE_ON_BATTERY;
+    } else if (p->discrete[OUT_D_OUTPUT_NOT_PROTECTING]) {
+        p->reg[OUT_R_UPS_STATE] = OUT_STATE_NOT_PROTECTING;
+    } else if (have_nst && (nst & NST(NST_CAL))) {
+        /* CAL is "performing a runtime calibration" and nothing else, which
+         * is the deep test. ups_test_result_t cannot tell the two tests
+         * apart -- it carries one "in progress" with no type field -- so
+         * this token is the only place in the whole stack where the
+         * distinction exists. A UPS that never sets it simply never reaches
+         * this state, and a deep test reads as SELF_TEST. */
+        p->reg[OUT_R_UPS_STATE] = OUT_STATE_CALIBRATING;
+    } else if ((d.status & UPS_STATUS_DISCHARGE) && p->discrete[OUT_D_ONLINE]) {
+        p->reg[OUT_R_UPS_STATE] = OUT_STATE_SELF_TEST;
+    } else if (p->discrete[OUT_D_ONLINE]) {
+        p->reg[OUT_R_UPS_STATE] = OUT_STATE_NORMAL;
+    } else {
+        /* Readable, and none of the above. Not NORMAL: see out_common.h. */
+        p->reg[OUT_R_UPS_STATE] = OUT_STATE_UNKNOWN;
+    }
+
     /* The AVR window: static for a unit, and what makes discretes 6 and 7
      * readable -- boost and trim say the mains left the window, these say
      * where it is. NUT variables rather than ups_data_t fields. */
@@ -283,7 +319,7 @@ static void build(out_points_t *p)
 
     /* Which addresses exist at all. Everything not set here is absent from
      * the datastore and answers Modbus exception 02, NOT 65535. */
-    for (int i = 0; i <= OUT_R_BEEPER; i++) p->reg_live[i] = true;
+    for (int i = 0; i <= OUT_R_UPS_STATE; i++) p->reg_live[i] = true;
     p->reg_live[OUT_R_FW_VERSION]   = true;
     p->reg_live[OUT_R_RESET_COUNT]  = true;
     p->reg_live[OUT_R_RESET_REASON] = true;
@@ -843,6 +879,7 @@ const char *out_common_reg_name(int i)
     case OUT_R_BATTERY_AGE_D:    return "Days since battery change";
     case OUT_R_TEST_RESULT:      return "Self-test result";
     case OUT_R_BEEPER:           return "Beeper";
+    case OUT_R_UPS_STATE:        return "UPS state";
     case OUT_R_TRANSFER_LOW_V10: return "Input transfer low";
     case OUT_R_TRANSFER_HIGH_V10:return "Input transfer high";
     case OUT_R_FW_VERSION:       return "Firmware version";

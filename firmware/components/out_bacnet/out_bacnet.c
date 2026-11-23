@@ -133,7 +133,7 @@ static const char *TAG = "out_bac";
 static bool reg_is_enum(int addr)
 {
     return addr == OUT_R_TEST_RESULT || addr == OUT_R_RESET_REASON ||
-           addr == OUT_R_BEEPER;
+           addr == OUT_R_BEEPER       || addr == OUT_R_UPS_STATE;
 }
 
 static bool reg_is_bacnet_point(int addr)
@@ -212,6 +212,18 @@ static const char BEEPER_STATES[] =
     "Disabled\0"           /* 1 */
     "Enabled\0"            /* 2 */
     "Muted\0"              /* 3 */
+    "\0";
+
+/* Register 13's states, in out_common's OUT_STATE_* order. The one point a
+ * site can watch on its own: "Self-test running" is the state that used to be
+ * indistinguishable from "Normal" on the bus. */
+static const char UPS_STATE_STATES[] =
+    "Normal\0"              /* 1 */
+    "Self-test running\0"   /* 2 */
+    "Calibration running\0" /* 3 */
+    "On battery\0"          /* 4 */
+    "Not protecting\0"      /* 5 */
+    "Unknown\0"             /* 6 */
     "\0";
 
 /* What each binary SAYS, instead of "Active" and "Inactive". Free -- bi.c
@@ -406,6 +418,7 @@ static void create_objects(void)
         { OUT_R_TEST_RESULT,  SELFTEST_STATES },
         { OUT_R_RESET_REASON, RESTART_STATES  },
         { OUT_R_BEEPER,       BEEPER_STATES   },
+        { OUT_R_UPS_STATE,    UPS_STATE_STATES},
     };
     for (unsigned k = 0; k < sizeof MSI / sizeof MSI[0]; k++) {
         const uint32_t inst = Multistate_Input_Create((uint32_t)MSI[k].reg + 1);

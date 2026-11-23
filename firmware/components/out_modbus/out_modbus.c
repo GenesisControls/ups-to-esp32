@@ -95,7 +95,7 @@ static uint8_t  s_cmd;          /* the command coil's one byte */
  * not have it", which a commissioning engineer needs. */
 typedef struct { uint16_t first, count; } block_t;
 static const block_t REG_BLOCKS[] = {
-    { 0,  13 },     /* 0-12  : the UPS. 0-7 are live in Niagara today */
+    { 0,  14 },     /* 0-13  : the UPS. 0-7 are live in Niagara today */
     { 16, 3  },     /* 16-18 : the adapter */
 };
 
