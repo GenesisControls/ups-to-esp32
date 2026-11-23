@@ -1329,14 +1329,14 @@ static esp_err_t post_bus(httpd_req_t *req)
         why = "could not save the command setting";
     } else if (cJSON_IsNumber(jp)) {
         int p = jp->valueint;
-        if (p == OUT_PROTO_BACNET_MSTP || p == OUT_PROTO_BACNET_IP) {
-            /* In the enum, served by nothing: there is no BACnet stack in
-             * this firmware yet. Accepting one would leave the board silent
-             * while the page named a protocol and the summary line claimed
-             * an address, so it is refused here as well as greyed out on
-             * the page. Both rows go live when out_bacnet does. */
-            why = "BACnet is not in this firmware yet";
-        } else if (p == OUT_PROTO_MODBUS_RTU && !BOARD_HAS_RS485) {
+        if (p == OUT_PROTO_BACNET_IP) {
+            /* In the enum, served by nothing: out_bacnet compiles the MS/TP
+             * datalink only (BACDL_MSTP), so BACnet/IP would leave the board
+             * silent while the page named a protocol. Refused here as well as
+             * greyed out on the page. */
+            why = "BACnet/IP is not in this firmware yet";
+        } else if ((p == OUT_PROTO_MODBUS_RTU || p == OUT_PROTO_BACNET_MSTP) &&
+                   !BOARD_HAS_RS485) {
             why = "this board has no RS485 transceiver";
         } else if (p == OUT_PROTO_MODBUS_TCP &&
                    netmgr_state() != NETMGR_STA_CONNECTED) {

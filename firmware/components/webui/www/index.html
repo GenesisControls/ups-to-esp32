@@ -638,8 +638,9 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
         the bus: this device never accepts commands from it. Changes need a restart.</p>
       <label for="bus-proto">Protocol</label>
       <select id="bus-proto"></select>
-      <p class="note">Modbus RTU and Modbus TCP work. BACnet needs a protocol stack that is not
-        in this firmware yet, so both BACnet rows stay greyed out until it is.</p>
+      <p class="note">Modbus RTU, Modbus TCP and BACnet MS/TP work. BACnet/IP stays greyed out:
+        its datalink is not compiled into this firmware. On BACnet MS/TP the data format below
+        does not apply &mdash; ANSI/ASHRAE 135 fixes MS/TP at 8 data bits, no parity, 1 stop bit.</p>
       <label for="bus-addr">Address <span class="note">(Modbus unit ID, or BACnet MS/TP MAC &mdash; 1 to 127)</span></label>
       <input id="bus-addr" inputmode="numeric" autocomplete="off">
       <label for="bus-fmt">Data format</label>
@@ -2190,7 +2191,7 @@ function busUI(b){
     // joined a network. A third element marks a protocol nothing serves yet
     // -- offered as a disabled row, so the list shows the whole plan without
     // letting anyone select silence.
-    if(b.rs485){ opts.push([2,'Modbus RTU (RS485)']); opts.push([3,'BACnet MS/TP (RS485)',1]); }
+    if(b.rs485){ opts.push([2,'Modbus RTU (RS485)']); opts.push([3,'BACnet MS/TP (RS485)']); }
     if(b.ip){ opts.push([4,'Modbus TCP']); opts.push([5,'BACnet/IP',1]); }
     $('bus-proto').innerHTML=opts.map(o=>`<option value="${o[0]}"${o[2]?' disabled':''}>${esc(o[1])}${o[2]?' \u2014 not in this firmware yet':''}</option>`).join('');
     $('bus-proto').value=String(b.proto||1);
@@ -2207,13 +2208,15 @@ function busUI(b){
   $('bus-sum').textContent = (b.proto>1) ? `${names[b.proto]} · address ${b.address}` : 'nothing selected';
   // An IP protocol has no baud rate and no data format, so the wire details
   // the serial line prints would be meaningless; it gets its port instead.
-  const onIp=b.proto===4||b.proto===5;
+  // MS/TP is 8N1 by standard, whatever the Modbus data-format setting happens
+  // to hold, so it must not print a stored parity it does not use.
+  const onIp=b.proto===4||b.proto===5, mstp=b.proto===3;
   let st;
   if(!b.proto||b.proto===1) st='Nothing is being served. Pick a protocol and restart.';
   else if(!b.running) st=`${names[b.proto]} is selected but not running — restart to apply.`;
   else if(b.quiet_s<0) st=onIp?'Listening on port 502. Nothing has connected yet.'
                              :`Running at ${b.baud||'auto'} baud. Nothing has polled this device yet.`;
-  else st=`Running ${onIp?'on port 502':`at ${b.baud} baud ${fmts[b.format||1]}`} · ${b.requests} request${b.requests===1?'':'s'} · last ${b.quiet_s}s ago`
+  else st=`Running ${onIp?'on port 502':`at ${b.baud} baud ${mstp?'8N1':fmts[b.format||1]}`} · ${b.requests} request${b.requests===1?'':'s'} · last ${b.quiet_s}s ago`
          + (b.writes?` · ${b.writes} write${b.writes===1?'':'s'} refused`:'');
   if(!b.ip) st+=' Modbus TCP and BACnet/IP appear once this board has joined a network.';
 

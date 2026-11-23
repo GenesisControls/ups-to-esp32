@@ -21,6 +21,7 @@
 #include "nut_server.h"
 #include "out_common.h"
 #include "out_modbus.h"
+#include "out_bacnet.h"
 #include "snmp.h"
 #include "auth.h"
 #include "webui.h"
@@ -316,6 +317,9 @@ void app_main(void)
      * still serve its page so somebody can see why. */
     if ((err = out_modbus_start()) != ESP_OK) {
         ESP_LOGE(TAG, "Modbus did not start: %s", esp_err_to_name(err));
+    }
+    if ((err = out_bacnet_start()) != ESP_OK) {
+        ESP_LOGE(TAG, "BACnet did not start: %s", esp_err_to_name(err));
     }
     /* An extra, like the fleet heartbeat: never start_failed()'s business. */
     if ((err = snmp_start()) != ESP_OK) ESP_LOGE(TAG, "SNMP did not start: %s", esp_err_to_name(err));
