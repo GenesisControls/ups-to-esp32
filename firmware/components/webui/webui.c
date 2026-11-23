@@ -399,7 +399,7 @@ static esp_err_t get_status(httpd_req_t *req)
                   "\"has485\":%s,\"ip\":%s,"
                   "\"address\":%d,\"baud\":%d,\"format\":%d,\"cmd\":%s,"
                   "\"devid\":%lu,\"devid_set\":%lu,\"devname\":\"%s\","
-                  "\"infofr\":%d,\"maxmast\":%d,\"mbport\":%d",
+                  "\"infofr\":%d,\"maxmast\":%d,\"mbport\":%d,\"tcpuid\":%d",
                   (int)out_common_proto(),
                   out_common_tcp_enabled() ? "true" : "false",
                   BOARD_HAS_RS485 ? "true" : "false",
@@ -411,7 +411,7 @@ static esp_err_t get_status(httpd_req_t *req)
                   (unsigned long)out_common_device_id(),
                   jesc(bac.device_name, e1, sizeof(e1)),
                   out_common_info_frames(), out_common_max_master(),
-                  out_common_mb_tcp_port());
+                  out_common_mb_tcp_port(), out_common_tcp_uid());
 
         /* Modbus RTU on the trunk. collisions and the per-access read counts
          * live here because they are serial facts. */
@@ -1427,9 +1427,9 @@ static esp_err_t post_bus(httpd_req_t *req)
                 want_proto == OUT_PROTO_BACNET_MSTP) && !BOARD_HAS_RS485) {
         why = "this board has no RS485 transceiver";
     } else if (!out_common_address_valid(want_addr, (out_proto_t)want_proto)) {
-        /* Judged against the primary protocol, whose range is the narrower of
-         * the two when MS/TP is selected. Modbus TCP shares the number and
-         * allows 1-247, so anything legal for the primary is legal for TCP. */
+        /* The RS485 address, judged against the RS485 protocol. Modbus TCP's
+         * unit id is a separate field with its own validation and is not
+         * constrained by this at all. */
         why = (want_proto == OUT_PROTO_BACNET_MSTP)
                   ? "a BACnet MS/TP MAC must be 0-127"
                   : "a Modbus address must be 1-247";
@@ -1464,6 +1464,8 @@ static esp_err_t post_bus(httpd_req_t *req)
             "max master must be 0-127");
     BUS_SET(root, "mbport", out_common_set_mb_tcp_port(jj->valueint),
             "the Modbus TCP port must be 1-65535");
+    BUS_SET(root, "tcpuid", out_common_set_tcp_uid(jj->valueint),
+            "the Modbus TCP unit id must be 0 (answer any) or 1-247");
 
     const cJSON *jc = cJSON_GetObjectItemCaseSensitive(root, "cmd");
     if (!why && cJSON_IsBool(jc) &&

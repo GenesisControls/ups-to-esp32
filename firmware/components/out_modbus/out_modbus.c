@@ -330,9 +330,12 @@ fail:
  * and unauthenticated, and a listener on every interface would serve the
  * point set there too; a BMS reaches this board over the network it joined,
  * which is the only place this data belongs. */
-static esp_err_t start_tcp(int addr)
+static esp_err_t start_tcp(void)
 {
     inst_t *in = &s_tcp;
+    /* Its OWN unit id, not the RS485 station address. 0 is the wildcard that
+     * answers whatever the master puts in the MBAP header. */
+    const int addr = out_common_tcp_uid();
 
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (!netif) {
@@ -375,8 +378,10 @@ static esp_err_t start_tcp(int addr)
     if (xTaskCreate(mb_task, "out_mb_tcp", 3072, in, 4, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "Modbus TCP slave up: unit %d on port %d, up to %d clients",
-             addr, port, CONFIG_FMB_TCP_PORT_MAX_CONN);
+    ESP_LOGI(TAG, "Modbus TCP slave up: port %d, unit id %s, up to %d clients",
+             port,
+             addr == OUT_TCP_UID_ANY ? "any (wildcard)" : "filtered",
+             CONFIG_FMB_TCP_PORT_MAX_CONN);
     return ESP_OK;
 }
 
@@ -457,24 +462,21 @@ static esp_err_t start_rtu(int addr)
 
 esp_err_t out_modbus_start(void)
 {
-    /* TWO INDEPENDENT OUTPUTS. RTU is the trunk's protocol, at most one of
-     * which runs; TCP is a separate switch. Both at once is the case this
-     * whole esp-modbus 2.x migration was for.
-     *
-     * The address is shared: it is the RTU station address and the TCP unit
-     * id, one number because a site thinks of it as one. */
+    /* TWO INDEPENDENT OUTPUTS, with independent addressing. RTU takes the
+     * RS485 station address; TCP takes its own unit id, which defaults to the
+     * wildcard. They described different networks all along -- sharing one
+     * number only looked harmless while one output ran at a time. */
     const bool want_rtu = (out_common_proto() == OUT_PROTO_MODBUS_RTU);
     const bool want_tcp = out_common_tcp_enabled();
     if (!want_rtu && !want_tcp) {
         return ESP_OK;                      /* not ours: cost the board nothing */
     }
 
-    const int addr = out_common_address();
     esp_err_t worst = ESP_OK;
 
     if (want_rtu) {
 #if BOARD_HAS_RS485
-        esp_err_t e = start_rtu(addr);
+        esp_err_t e = start_rtu(out_common_address());
 #else
         ESP_LOGE(TAG, "Modbus RTU selected, but this board has no RS485 transceiver");
         esp_err_t e = ESP_ERR_NOT_SUPPORTED;
@@ -486,7 +488,7 @@ esp_err_t out_modbus_start(void)
         if (e != ESP_OK) worst = e;
     }
     if (want_tcp) {
-        esp_err_t e = start_tcp(addr);
+        esp_err_t e = start_tcp();
         if (e != ESP_OK && worst == ESP_OK) worst = e;
     }
 

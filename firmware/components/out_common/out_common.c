@@ -33,6 +33,7 @@ static const char *TAG = "outcom";
 #define KEY_INFOFR      "oc_infofr"
 #define KEY_MAXMAST     "oc_maxmast"
 #define KEY_MBPORT      "oc_mbport"
+#define KEY_TCPUID      "oc_tcpuid"
 #define KEY_TCPEN       "oc_tcpen"
 
 /* Comm-OK's threshold. The other track's README specifies 10 s, and upstream
@@ -65,6 +66,7 @@ static uint32_t          s_devid = OUT_DEVID_DERIVE;
 static int               s_info_frames = OUT_INFOFRAMES_DEFAULT;
 static int               s_max_master = OUT_MAXMASTER_DEFAULT;
 static int               s_mb_tcp_port = OUT_MB_TCP_PORT_DEFAULT;
+static int               s_tcp_uid = OUT_TCP_UID_ANY;
 
 /* ---- helpers ---------------------------------------------------------- */
 
@@ -335,6 +337,8 @@ static void load_settings(void)
     if (nvs_get_u8(h, KEY_MAXMAST, &mm) == ESP_OK && mm <= 127) s_max_master = mm;
     uint16_t mp = 0;
     if (nvs_get_u16(h, KEY_MBPORT, &mp) == ESP_OK && mp >= 1) s_mb_tcp_port = mp;
+    uint8_t tu = 0;
+    if (nvs_get_u8(h, KEY_TCPUID, &tu) == ESP_OK && tu <= 247) s_tcp_uid = tu;
     nvs_close(h);
 }
 
@@ -397,9 +401,9 @@ bool out_common_address_valid(int addr, out_proto_t p)
          * master), and 0 is a legal master address. */
         return addr >= 0 && addr <= 127;
     case OUT_PROTO_MODBUS_RTU:
-    case OUT_PROTO_MODBUS_TCP:
         /* 1-247. 0 is the Modbus broadcast address and no device may own it;
-         * 248-255 are reserved. */
+         * 248-255 are reserved. Modbus TCP is absent from this switch on
+         * purpose: its unit id is its own setting now and never judged here. */
         return addr >= 1 && addr <= 247;
     default:
         /* Nothing on the bus, or BACnet/IP where the address is an IP and
@@ -414,10 +418,10 @@ esp_err_t out_common_set_address(int addr)
     /* Validated against the protocol in force. A caller changing BOTH must
      * check the pair itself before setting either, or the order decides
      * whether a legal combination is accepted -- see post_bus in webui. */
-    /* Judged against the TRUNK protocol. Modbus TCP shares this number as
-     * its unit id, and its 1-247 range is the wider of the two, so a value
-     * legal for the trunk is always legal for TCP as well -- which is what
-     * lets one stored number serve both at once. */
+    /* Judged against the RS485 protocol, which is the only thing that uses
+     * this number. Modbus TCP had its unit id carved out of here on
+     * 2026-11-22 precisely so that one network's addressing could not
+     * constrain the other's. */
     if (!out_common_address_valid(addr, s_proto)) return ESP_ERR_INVALID_ARG;
     esp_err_t e = put_u8(KEY_ADDR, (uint8_t)addr);
     if (e == ESP_OK) s_addr = addr;
@@ -477,10 +481,15 @@ esp_err_t out_common_init(void)
              s_hb == OUT_HB_RUN ? "keeps counting" : "reads 65535");
     /* All three outputs, because all three can be on. A log line naming only
      * one of them is how "but it IS configured" arguments start. */
-    ESP_LOGI(TAG, "bus: %s, Modbus TCP %s; address %d, baud %s, %s",
-             out_common_proto_name(s_proto), s_tcp_en ? "on" : "off",
-             s_addr, s_baud == OUT_BAUD_AUTO ? "auto" : "fixed",
-             out_common_format_name(s_fmt));
+    ESP_LOGI(TAG, "bus: %s at address %d, baud %s, %s; Modbus TCP %s",
+             out_common_proto_name(s_proto), s_addr,
+             s_baud == OUT_BAUD_AUTO ? "auto" : "fixed",
+             out_common_format_name(s_fmt),
+             s_tcp_en ? "on" : "off");
+    if (s_tcp_en) {
+        ESP_LOGI(TAG, "Modbus TCP: port %d, unit id %s", s_mb_tcp_port,
+                 s_tcp_uid == OUT_TCP_UID_ANY ? "any" : "filtered");
+    }
     return ESP_OK;
 }
 
@@ -586,6 +595,19 @@ static esp_err_t put_u16(const char *key, uint16_t v)
     nvs_set_u16(h, key, v);
     e = nvs_commit(h);
     nvs_close(h);
+    return e;
+}
+
+int out_common_tcp_uid(void) { return s_tcp_uid; }
+
+esp_err_t out_common_set_tcp_uid(int uid)
+{
+    /* 0 is the wildcard, 1-247 a filter. 248-255 are reserved by the spec and
+     * 255 is answered unconditionally by the stack anyway, so there is nothing
+     * a value above 247 could usefully mean. */
+    if (uid < 0 || uid > 247) return ESP_ERR_INVALID_ARG;
+    esp_err_t e = put_u8(KEY_TCPUID, (uint8_t)uid);
+    if (e == ESP_OK) s_tcp_uid = uid;
     return e;
 }
 

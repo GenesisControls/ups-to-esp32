@@ -702,6 +702,16 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
       </div>
 
 
+      <div id="f-tcpuid">
+        <label for="bus-tcpuid">Modbus TCP unit ID</label>
+        <input id="bus-tcpuid" inputmode="numeric" autocomplete="off">
+        <p class="note"><b>0</b> answers whatever unit ID the master sends, and is the default.
+          Set 1&ndash;247 only to make this device ignore anything else &mdash; it is a filter,
+          not an identity, and the usual result of setting one is a silent socket because the
+          BMS was sending something different. Separate from the RS485 address above: they
+          describe different networks. 255 is always answered, by convention.</p>
+      </div>
+
       <div id="f-mbport">
         <label for="bus-mbport">TCP port</label>
         <input id="bus-mbport" inputmode="numeric" autocomplete="off">
@@ -2241,34 +2251,32 @@ if($('fwup-go')) $('fwup-go').onclick=async()=>{
 //
 // Driven by the live controls, not the saved settings, so the fields follow a
 // choice immediately rather than after a save and a restart.
-const BUS_GROUPS=['f-addr','f-devid','f-fmt','f-baud','f-mstp','f-mbport','f-cmd'];
+const BUS_GROUPS=['f-addr','f-devid','f-fmt','f-baud','f-mstp','f-tcpuid','f-mbport','f-cmd'];
 function busFields(){
   const t=+$('bus-proto').value||1, tcp=$('bus-tcp-en').checked;
   const rtu=t===2, mstp=t===3;
   const on={
-    'f-addr'  : rtu||mstp||tcp,    // the station address, shared
+    'f-addr'  : rtu||mstp,         // the RS485 station address
     'f-baud'  : rtu||mstp,         // serial only
     'f-fmt'   : rtu,               // MS/TP is 8N1 by standard
     'f-mstp'  : mstp,              // token passing
     'f-devid' : mstp,              // BACnet identity
+    'f-tcpuid': tcp,               // its own, not the RS485 address
     'f-mbport': tcp,
     'f-cmd'   : rtu||tcp,          // coil 100 is Modbus; BACnet has no equivalent
   };
   for(const g of BUS_GROUPS){ const el=$(g); if(el) el.hidden=!on[g]; }
 
-  // The same stored number, named as each transport names it. With a serial
-  // protocol AND Modbus TCP on, one number is both, so say so rather than
-  // picking one name and leaving the other unexplained.
-  $('bus-addr-label').textContent = (rtu||mstp) ? 'MAC address' : 'Unit ID';
+  // RS485 only now, so one name and one range -- the Modbus TCP unit id has
+  // its own field rather than borrowing this number.
+  $('bus-addr-label').textContent='MAC address';
   $('bus-addr-hint').textContent =
-    mstp ? (tcp?'(MS/TP station address 0-127; also the Modbus TCP unit id)'
-               :'(MS/TP station address, 0 to 127)')
-         : (rtu&&tcp?'(RS485 station address, and the Modbus TCP unit id)':'(1 to 247)');
+    mstp ? '(MS/TP station address, 0 to 127)' : '(Modbus slave address, 1 to 247)';
 }
 let busBuilt=null;
 function busUI(b){
   const key=JSON.stringify([b.has485,b.ip,b.proto,b.tcp_en,b.address,b.baud,b.format,b.cmd,
-                            b.devid_set,b.infofr,b.maxmast,b.mbport]);
+                            b.devid_set,b.infofr,b.maxmast,b.mbport,b.tcpuid]);
   if(busBuilt!==key){
     busBuilt=key;
     // A board with no transceiver cannot offer the two RS485 protocols. The
@@ -2289,6 +2297,7 @@ function busUI(b){
     $('bus-infofr').value=String(b.infofr||1);
     $('bus-maxmast').value=String(b.maxmast===undefined?127:b.maxmast);
     $('bus-mbport').value=String(b.mbport||502);
+    $('bus-tcpuid').value=String(b.tcpuid===undefined?0:b.tcpuid);
     busFields();
   }
   // What the device is actually using, which differs from the field whenever
@@ -2313,8 +2322,10 @@ function busUI(b){
   if(b.tcp_en) live.push(['Modbus TCP', tcp, `on port ${tcp.port||b.mbport||502}`,
                           b.ip?null:'on, and starts once this board joins a network.']);
 
+  // The address belongs to the RS485 output only, so it is named only when
+  // there is one -- a TCP-only board has no station address to show.
   $('bus-sum').textContent = live.length
-    ? live.map(([name])=>name).join(' + ') + ` · address ${b.address}`
+    ? live.map(([name])=>name).join(' + ') + (t>1?` · address ${b.address}`:'')
     : 'nothing selected';
 
   let st;
@@ -2401,6 +2412,7 @@ $('bus-save').onclick=async()=>{
                                 infofr:+$('bus-infofr').value,
                                 maxmast:+$('bus-maxmast').value,
                                 mbport:+$('bus-mbport').value,
+                                tcpuid:+$('bus-tcpuid').value,
                                 cmd:$('bus-cmd').checked});
   if(!r.ok){ toast(r.error||'failed'); return; }
   busBuilt=null; toast('Saved — restart to apply'); poll();

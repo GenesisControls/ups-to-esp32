@@ -133,10 +133,13 @@ const char *out_common_proto_name(out_proto_t p);
 bool      out_common_tcp_enabled(void);
 esp_err_t out_common_set_tcp_enabled(bool on);
 
-/* The station address. One stored number for all four protocols, because a
- * site thinks of it as one thing -- "which device is this" -- even though each
- * protocol names it differently. The page labels it per transport: MAC on the
- * serial trunks, Unit ID over Modbus TCP. Default 4.
+/* The RS485 station address: Modbus RTU's slave address, or BACnet MS/TP's
+ * MAC. Default 4.
+ *
+ * RS485 ONLY. Modbus TCP has its own unit id below, because the two describe
+ * different networks and sharing one number forced them equal -- fine while
+ * only one output ran, wrong the moment both do. A site's trunk layout has
+ * nothing to say about what unit id its BMS puts in a TCP header.
  *
  * The VALID RANGE DEPENDS ON THE PROTOCOL: 1-247 for Modbus (RTU and TCP),
  * 0-127 for a BACnet MS/TP master, since MS/TP's token passing cannot address
@@ -217,6 +220,22 @@ int       out_common_info_frames(void);
 esp_err_t out_common_set_info_frames(int n);
 int       out_common_max_master(void);
 esp_err_t out_common_set_max_master(int n);
+
+/* Modbus TCP's unit id, the byte in the MBAP header. Independent of the
+ * RS485 address above.
+ *
+ * 0 MEANS "ANSWER WHATEVER THE MASTER SENDS", and is the default. esp-modbus
+ * treats a TCP slave address of 0 as a wildcard (mb_slave.c: tcp_uid_wildcard)
+ * and additionally always answers 255, the Modbus-TCP convention for "the
+ * device itself". A fixed value here is therefore a filter, not an identity,
+ * and setting one is how you get a silent socket: the BMS sends 1, the device
+ * wants 4, and nothing on either side reports a fault. Default to answering
+ * everything and let a site narrow it deliberately.
+ *
+ * 1-247 to filter; 248-255 are reserved and 0 is the wildcard. */
+#define OUT_TCP_UID_ANY 0
+int       out_common_tcp_uid(void);
+esp_err_t out_common_set_tcp_uid(int uid);
 
 /* The Modbus TCP port. Changeable because a site running two devices behind
  * one NAT, or with its own firewall policy, has no other way out. Changing it
