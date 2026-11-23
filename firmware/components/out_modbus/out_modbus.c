@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #include "out_modbus.h"
 #include "out_common.h"
-#include "ups_hid.h"
 #include "board.h"
 #include "mbcontroller.h"
 #include "driver/uart.h"
@@ -32,10 +31,6 @@ static const char *TAG = "out_mb";
  * Write 1 to start. It self-clears, so it is a trigger and not a state; a
  * master that leaves it set does not re-fire. */
 #define CMD_COIL_ADDR   100
-/* A stuck or misconfigured master must not be able to cycle the battery. A
- * quick test is seconds of load on battery; one every half hour is generous
- * for any real use and useless as a way to flatten a pack. */
-#define CMD_MIN_GAP_US  (30LL * 60 * 1000000)
 
 /* 2.x asks for a response timeout per instance. This is how long the stack
  * waits on its own internals, not how long a master waits for us; the default
@@ -77,12 +72,12 @@ typedef struct {
 static inst_t s_rtu = { .what = "RTU", .is_rtu = true  };
 static inst_t s_tcp = { .what = "TCP", .is_rtu = false };
 
-/* The command coil and its rate limit are DEVICE-WIDE, not per instance. One
- * self-test per thirty minutes is a statement about the battery, not about a
- * transport, and keeping them per instance would let a master on the trunk
- * and a client over TCP each start one inside the same window. */
+/* The command coil is DEVICE-WIDE, not per instance: both Modbus instances
+ * serve the one coil, as they serve the one register image. The rate limit
+ * that used to sit beside it has moved further out still, into out_common,
+ * because BACnet MS/TP now has a trigger of its own (BV1) and the limit has
+ * to cover every path to the same battery. */
 static uint8_t  s_cmd;          /* the command coil's one byte */
-static int64_t  s_cmd_last_us;
 
 /* The contiguous blocks of the address map, with the reserved ranges left
  * OUT. This is how "a planned address answers exception 02" is enforced: an
@@ -130,44 +125,16 @@ static void refresh(void)
  * coils are MB_ACCESS_RO and the stack itself refuses the write. Only the
  * command coil is writable, because cmd_check() has to see what was written
  * in order to refuse it on its own terms. */
-/* Coil 100 went high. Everything that can refuse this, refuses it here.
- *
- * Reversing "read-only on the bus" was Tobias's call on 2026-11-22; the
- * reasons it was the rule are unchanged, so the guards are the compensation:
- * the board owner opts in, the UPS must say it can self-test, and the rate
- * limit means the worst a hostile or broken master achieves is one quick
- * test every half hour. */
+/* Coil 100 went high. out_common does the refusing, for every transport, and
+ * logs whichever guard said no; all that is left here is the trigger
+ * semantics and this instance's count. */
 static void cmd_check(inst_t *in)
 {
     if (!(s_cmd & 1u)) return;
     s_cmd = 0;                                  /* a trigger, not a state */
 
-    if (!out_common_cmd_enabled()) {
-        ESP_LOGW(TAG, "self-test requested from the bus, but commands are off on this board");
-        return;
-    }
-    ups_data_t d;
-    ups_hid_get(&d);
-    if (!d.attached) {
-        ESP_LOGW(TAG, "self-test requested, but no UPS is attached");
-        return;
-    }
-    if (!(d.caps & UPS_CAP_TEST)) {
-        /* From the UPS's own report descriptor, never from its model name. */
-        ESP_LOGW(TAG, "self-test requested, but this UPS does not report that it can");
-        return;
-    }
-    int64_t now = esp_timer_get_time();
-    if (s_cmd_last_us && (now - s_cmd_last_us) < CMD_MIN_GAP_US) {
-        ESP_LOGW(TAG, "self-test requested %llds after the last one; ignored (minimum %lld min)",
-                 (long long)((now - s_cmd_last_us) / 1000000),
-                 (long long)(CMD_MIN_GAP_US / 60000000));
-        return;
-    }
-    s_cmd_last_us = now;
-    esp_err_t e = ups_hid_command(UPS_CMD_TEST_QUICK, 0);
-    ESP_LOGW(TAG, "QUICK BATTERY SELF-TEST started from the bus: %s. "
-                  "The load is on battery while it runs.", esp_err_to_name(e));
+    if (out_common_request_selftest("Modbus coil 100") != ESP_OK) return;
+
     xSemaphoreTake(in->lock, portMAX_DELAY);
     in->stat.tests_started++;
     xSemaphoreGive(in->lock);

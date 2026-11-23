@@ -632,6 +632,49 @@ esp_err_t out_common_set_tcp_enabled(bool on)
 
 bool out_common_cmd_enabled(void) { return s_cmd_enabled; }
 
+/* A stuck or misconfigured master must not be able to cycle the battery. A
+ * quick test is seconds of load on battery; one every half hour is generous
+ * for any real use and useless as a way to flatten a pack. */
+#define CMD_MIN_GAP_US  (30LL * 60 * 1000000)
+static int64_t s_cmd_last_us;
+
+esp_err_t out_common_request_selftest(const char *via)
+{
+    /* Reversing "read-only on the bus" was Tobias's call on 2026-11-22; the
+     * reasons it was the rule are unchanged, so these guards are the
+     * compensation: the board owner opts in, the UPS must say it can
+     * self-test, and the rate limit means the worst a hostile or broken
+     * master achieves is one quick test every half hour. */
+    if (!s_cmd_enabled) {
+        ESP_LOGW(TAG, "self-test requested via %s, but commands are off on this board", via);
+        return ESP_ERR_NOT_ALLOWED;
+    }
+    ups_data_t d;
+    ups_hid_get(&d);
+    if (!d.attached) {
+        ESP_LOGW(TAG, "self-test requested via %s, but no UPS is attached", via);
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (!(d.caps & UPS_CAP_TEST)) {
+        /* From the UPS's own report descriptor, never from its model name. */
+        ESP_LOGW(TAG, "self-test requested via %s, but this UPS does not report that it can", via);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const int64_t now = esp_timer_get_time();
+    if (s_cmd_last_us && (now - s_cmd_last_us) < CMD_MIN_GAP_US) {
+        ESP_LOGW(TAG, "self-test requested via %s %llds after the last one; ignored "
+                      "(minimum %lld min)", via,
+                 (long long)((now - s_cmd_last_us) / 1000000),
+                 (long long)(CMD_MIN_GAP_US / 60000000));
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_cmd_last_us = now;
+    const esp_err_t e = ups_hid_command(UPS_CMD_TEST_QUICK, 0);
+    ESP_LOGW(TAG, "QUICK BATTERY SELF-TEST started via %s: %s. "
+                  "The load is on battery while it runs.", via, esp_err_to_name(e));
+    return ESP_OK;
+}
+
 esp_err_t out_common_set_cmd_enabled(bool on)
 {
     esp_err_t e = put_u8(KEY_CMD, on ? 1 : 0);

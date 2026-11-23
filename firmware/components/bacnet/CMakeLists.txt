@@ -6,8 +6,16 @@
 # The source list is NOT a guess. It is bacnet-stack's own
 # ports/esp32/extra_script.py, m5stamplc-mstp environment: its common group
 # plus its MS/TP transport group, which is the upstream author's answer to
-# "what does MS/TP on an ESP32 need". One deliberate subtraction: bo.c
-# (Binary Output), because this adapter serves nothing writable.
+# "what does MS/TP on an ESP32 need". Two deliberate changes to that list:
+#
+#   - bo.c (Binary Output) is left OUT. A BO models a physical output this
+#     board does not have, and in this stack it is commandable: a priority
+#     array, a relinquish default and a second way to set the same value.
+#   - bv.c (Binary Value) is ADDED, for the one writable point on the device:
+#     BV1, which starts a battery self-test. It is NOT commandable here,
+#     because BACNET_OBJECT_BINARY_VALUE_COMMANDABLE is not defined below --
+#     so present-value is a plain bool with no priority array, which is what
+#     lets out_bacnet treat a write as a momentary trigger and clear it.
 #
 # Device_Init and friends come from basic/server/bacnet_device.c. There is a
 # SECOND implementation in basic/object/device.c, which the port does not
@@ -49,6 +57,7 @@ set(BACNET_SRCS
     "src/bacnet/basic/server/bacnet_device.c"
     "src/bacnet/basic/object/ai.c"
     "src/bacnet/basic/object/bi.c"
+    "src/bacnet/basic/object/bv.c"
 
     # --- service handlers: everything a BMS asks an MS/TP device ---
     "src/bacnet/basic/service/h_apdu.c"
@@ -107,6 +116,11 @@ target_compile_definitions(${COMPONENT_LIB} PUBLIC
     BACNET_PROTOCOL_REVISION=16
     CONFIG_BACNET_BASIC_OBJECT_ANALOG_INPUT
     CONFIG_BACNET_BASIC_OBJECT_BINARY_INPUT
+    CONFIG_BACNET_BASIC_OBJECT_BINARY_VALUE
+    # NOT defined, on purpose: BACNET_OBJECT_BINARY_VALUE_COMMANDABLE, and
+    # INTRINSIC_REPORTING / BINARY_VALUE_INTRINSIC_REPORTING. The first would
+    # give BV1 a priority array it has no use for; the second is what guards
+    # bv.c's only calls into bactext_*(), which is not compiled in here.
 )
 
 # Third-party code against ESP-IDF's -Werror=all. These are warnings in

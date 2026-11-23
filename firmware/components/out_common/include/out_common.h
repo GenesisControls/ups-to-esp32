@@ -323,10 +323,25 @@ out_hb_policy_t out_common_hb_policy(void);
  * the weight the default used to. A site that wants the old behaviour clears
  * the checkbox on the board's own page.
  *
- * The command itself carries its own guards in out_modbus: quick test only,
- * refused unless the UPS's own descriptor reports UPS_CAP_TEST, rate
- * limited, and logged every time. */
+ * The guards are in out_common_request_selftest() below, which is the only
+ * way in for either protocol. */
 bool      out_common_cmd_enabled(void);
 esp_err_t out_common_set_cmd_enabled(bool on);
+
+/* Starts one quick battery self-test, if everything that can refuse it
+ * agrees: this board has been opted in, a UPS is attached, its own report
+ * descriptor says it can self-test, and the last one was over half an hour
+ * ago. The outcome is logged either way, with `via` naming what asked, so a
+ * technician reading the console learns which bus started a test.
+ *
+ * SHARED ON PURPOSE. Modbus TCP can run alongside BACnet MS/TP, so two
+ * transports can reach the same battery. The half-hour limit is a statement
+ * about the pack, not about a bus, and living here is what stops each path
+ * keeping its own -- which would have doubled the real rate the day MS/TP
+ * gained a trigger of its own.
+ *
+ * ESP_OK means the command reached the UPS. Callers count that and nothing
+ * else; every refusal is already logged here. */
+esp_err_t out_common_request_selftest(const char *via);
 
 #endif /* GENESIS_OUT_COMMON_H */

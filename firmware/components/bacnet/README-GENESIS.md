@@ -49,14 +49,29 @@ This resolves "confirm `bacnet-stack` licence terms" from the project brief's
 
 - **every header** (270 files, 1.07 MB) — the stack cross-includes widely and
   cherry-picking headers would break on the next update for no real saving
-- **59 source files** (1.72 MB) — not a guess. This is bacnet-stack's own
-  `ports/esp32/extra_script.py`, `m5stamplc-mstp` environment: its common group
-  plus its MS/TP transport group. That is the upstream author's own answer to
-  "what does MS/TP on an ESP32 need."
+- **60 source files** (1.75 MB) — the list is not a guess. It is
+  bacnet-stack's own `ports/esp32/extra_script.py`, `m5stamplc-mstp`
+  environment: its common group plus its MS/TP transport group. That is the
+  upstream author's own answer to "what does MS/TP on an ESP32 need."
 
-One deliberate subtraction from that list: **`basic/object/bo.c`** (Binary
-Output). This adapter serves nothing writable, so the object type is not
-compiled and not registered.
+Two deliberate changes to that list:
+
+- **`basic/object/bo.c` (Binary Output) is left out.** A BO models a physical
+  output this board does not have, and in this stack it is commandable: a
+  priority array, a relinquish default and a second route to the same value.
+- **`basic/object/bv.c` (Binary Value) is added**, on 2026-11-23, for BV1 —
+  the one writable point on the device, which starts a battery self-test.
+  Adding BV1 cost **3584 bytes** of flash, measured end to end (0x15fd20 ->
+  0x160720): this file, the object, its strings and `out_bacnet`'s write
+  wrapper together. The file alone is 2700 lines, so most of it never reaches
+  the image — the linker drops what the defines leave out, which here means
+  intrinsic reporting and the commandable present-value paths, since
+  `BACNET_OBJECT_BINARY_VALUE_COMMANDABLE` is not defined.
+
+`bv.c` is also why `bactext.c` is still absent: its only calls into
+`bactext_*()` sit inside `#if defined(INTRINSIC_REPORTING) &&
+(BINARY_VALUE_INTRINSIC_REPORTING)`, neither of which is defined here. Define
+either one and the link breaks until `bactext.c` is vendored too.
 
 Nothing from `ports/esp32/` was copied. See below.
 
@@ -67,7 +82,7 @@ Nothing from `ports/esp32/` was copied. See below.
 `basic/object/client/device-client.c`. Only the first is vendored here, because
 only the first is in the port's list. `device.h` *is* present (all headers are),
 so adding `device.c` back later looks harmless and would give duplicate symbols
-at link time. The vendored `.c` count is 59 and `CMakeLists.txt` lists 59; if
+at link time. The vendored `.c` count is 60 and `CMakeLists.txt` lists 60; if
 those ever disagree, that is the bug.
 
 **Configuration is by `-D`, not by editing `config.h`.** The defines in

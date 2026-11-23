@@ -1,12 +1,15 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  *
  * BACnet MS/TP output. Serves the out_common point set as BACnet objects on
- * the RS485 trunk, read-only.
+ * the RS485 trunk, read-only but for BV1.
  *
  * Instance numbering is the Modbus address + 1 -- BI1..BI11 for discretes
- * 0..10, AI<n+1> for register n -- so one map covers both protocols. See the
- * comment at the top of out_bacnet.c for why that differs from the brief's
- * proposed BACnet table, and for how Reliability replaces Modbus's 65535.
+ * 0..10, AI<n+1> for register n -- so one map covers both protocols. BV1 is
+ * the exception and the only writable object: writing it Active starts a
+ * battery self-test, the BACnet counterpart of Modbus coil 100. See the
+ * comment at the top of out_bacnet.c for why the point numbering differs from
+ * the brief's proposed BACnet table, for how Reliability replaces Modbus's
+ * 65535, and for why BV1 is a Value rather than an Output.
  */
 #pragma once
 
@@ -30,6 +33,7 @@ typedef struct {
     int64_t  last_request_us;    /* esp_timer stamp, 0 if never */
     uint32_t bytes_tx;
     uint32_t bytes_rx;
+    uint32_t tests_started;      /* self-tests started by a write to BV1 */
 } out_bacnet_stat_t;
 
 /* Starts the datalink and the MS/TP task, but only if BACnet MS/TP is the

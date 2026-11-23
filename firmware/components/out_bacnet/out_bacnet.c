@@ -32,10 +32,48 @@
  * Real units, too: Modbus register 3 is volts x10 because it has to be an
  * integer. AI4 is volts, because an AI is a float with a units property.
  *
- * READ-ONLY. No writable objects at all: bo.c is not even compiled into the
- * vendored stack. The self-test trigger stays a Modbus coil for now -- giving
- * it a BACnet Binary Output would mean a writable object, a commandable
- * priority array and a second path into the same guard, and no site has asked.
+ * READ-ONLY, WITH ONE EXCEPTION: BV1.
+ *
+ * Every BI and AI here is read-only, and a WriteProperty to one earns
+ * write-access-denied. BV1 is the single writable point on the device, and
+ * writing it ACTIVE starts one quick battery self-test -- the BACnet half of
+ * what Modbus does with coil 100.
+ *
+ * It is a Binary VALUE, not a Binary Output, because a BO models a physical
+ * output this board does not have. bo.c is still not compiled in.
+ *
+ * Nor is BV1 commandable: BACNET_OBJECT_BINARY_VALUE_COMMANDABLE is left
+ * undefined in the vendored stack, so present-value is a plain bool with no
+ * priority array. That is what lets this be a momentary trigger -- the write
+ * lands, we start the test, and we put present-value straight back to
+ * INACTIVE. A commandable BV would have fought that, because the value would
+ * have belonged to whatever priority wrote it.
+ *
+ * BACNET REFUSES BETTER THAN MODBUS, and we use that. Coil 100 is always
+ * writable; when commands are off for a board, esp-modbus accepts the write
+ * and we drop it with a log line the technician never sees. BV1 instead gets
+ * Binary_Value_Write_Disable(), and bv.c then answers the write itself with
+ * write-access-denied -- a refusal the BMS can see.
+ *
+ * (bv.c also drops present-value from the object's writable-property list
+ * when writes are disabled, which sounds better still, but is worth nothing
+ * HERE: the only thing in this stack that reads that list is the
+ * backup-and-restore configuration encoder, behind BACNET_BACKUP_RESTORE,
+ * which is not defined and whose bacfile.c is not vendored. In this build the
+ * list answers nothing on the wire.)
+ *
+ * WHY WE WRAP bv.c's WRITE instead of using it directly: its own writable
+ * list is wider than this device wants. object-name, description and
+ * out-of-service are "always writable" there, regardless of Write_Enabled, so
+ * a BMS could rename our object or park BV1 out of service -- and an
+ * out-of-service BV1 keeps whatever present-value was last written to it,
+ * which on a commissioning screen reads as a self-test that never ends.
+ *
+ * None of that could ever START a test: bv.c deliberately skips the write
+ * callback while Out_Of_Service is set, which is what out-of-service means.
+ * It is wrong for a device documented as read-only but for one trigger, not
+ * unsafe. bv_write() below refuses every property except present-value, and
+ * closes the out-of-service route as a side effect.
  */
 
 #include "out_bacnet.h"
@@ -60,6 +98,7 @@ static const char *TAG = "out_bac";
 #include "bacnet/basic/binding/address.h"
 #include "bacnet/basic/object/ai.h"
 #include "bacnet/basic/object/bi.h"
+#include "bacnet/basic/object/bv.h"
 #include "bacnet/basic/object/device.h"
 #include "bacnet/basic/services.h"
 #include "bacnet/basic/sys/mstimer.h"
@@ -96,13 +135,42 @@ static BACNET_ENGINEERING_UNITS reg_units(int addr, float *divisor)
     return UNITS_NO_UNITS;
 }
 
+/* The one writable object. BV1, not BV101 (coil 100 + 1): the "instance =
+ * Modbus address + 1" rule above maps the POINT SET, and this is a command
+ * rather than a point -- which is also why it is a different object type and
+ * why Modbus put it at 100, far outside its data block. One BV on the device,
+ * numbered 1, is what an engineer browsing it expects to find. */
+#define SELFTEST_BV     1
+
 static uint8_t                       s_pdu[MAX_MPDU + 16];
+/* Set by the write callback, acted on by bac_task. NOT done inside the
+ * callback: it runs from npdu_handler(), before the SimpleAck is encoded, and
+ * a USB HID command in there would push the ack past what a master waits
+ * for. Same shape as out_modbus, where the coil is written by the stack and
+ * read by the task loop. */
+static volatile bool                 s_bv_written;
 static volatile struct mstp_port_struct_t s_mstp;
 static struct dlmstp_user_data_t     s_mstp_user;
 static uint8_t                       s_in[DLMSTP_MPDU_MAX];
 static uint8_t                       s_out[DLMSTP_MPDU_MAX];
 static out_bacnet_stat_t             s_stat;
 static SemaphoreHandle_t             s_stat_lock;
+
+/* Present-value is the only thing on BV1 a BMS may write. bv.c would also
+ * accept object-name, description and out-of-service, which this device has
+ * no business letting a trunk change -- see the header comment. Refusing them
+ * here is one `if`, and it keeps "read-only but for the trigger" true as
+ * written rather than true with footnotes. */
+static bool bv_write(BACNET_WRITE_PROPERTY_DATA *wp_data)
+{
+    if (wp_data->object_property != PROP_PRESENT_VALUE) {
+        wp_data->error_class = ERROR_CLASS_PROPERTY;
+        wp_data->error_code  = ERROR_CODE_WRITE_ACCESS_DENIED;
+        return false;
+    }
+    /* And this still refuses it when the board has commands switched off. */
+    return Binary_Value_Write_Property(wp_data);
+}
 
 static struct dlmstp_rs485_driver s_driver = {
     .init                 = bacnet_rs485_init,
@@ -138,6 +206,19 @@ static object_functions_t s_objects[] = {
       Analog_Input_Intrinsic_Reporting, NULL, NULL, Analog_Input_Create,
       Analog_Input_Delete, NULL, Analog_Input_Writable_Property_List },
 
+    /* The only row with a write function, and it is ours rather than bv.c's
+     * -- see bv_write(). Present-value still ends up in
+     * Binary_Value_Write_Property, which does the Write_Enabled check, so
+     * "commands are off for this board" is answered by the stack. */
+    { OBJECT_BINARY_VALUE, Binary_Value_Init, Binary_Value_Count,
+      Binary_Value_Index_To_Instance, Binary_Value_Valid_Instance,
+      Binary_Value_Object_Name, Binary_Value_Read_Property,
+      bv_write, Binary_Value_Property_Lists, NULL, NULL,
+      Binary_Value_Encode_Value_List, Binary_Value_Change_Of_Value,
+      Binary_Value_Change_Of_Value_Clear, NULL, NULL, NULL,
+      Binary_Value_Create, Binary_Value_Delete, NULL,
+      Binary_Value_Writable_Property_List },
+
     { MAX_BACNET_OBJECT_TYPE, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
       NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
 };
@@ -163,6 +244,34 @@ static uint32_t device_instance_from_mac(char *name, size_t cap)
     return ((uint32_t)mac[3] << 16 | (uint32_t)mac[4] << 8 | mac[5]) & OUT_DEVID_MAX;
 }
 
+/* bv.c calls this after a present-value write it has already accepted, which
+ * means Write_Enabled was true -- so there is no permission check to repeat
+ * here. Only ACTIVE starts anything: a master writing INACTIVE is clearing
+ * the point, which is what we do ourselves anyway. */
+static void bv_written(uint32_t instance, BACNET_BINARY_PV old_value,
+                       BACNET_BINARY_PV value)
+{
+    (void)old_value;
+    if (instance == SELFTEST_BV && value == BINARY_ACTIVE) s_bv_written = true;
+}
+
+/* Runs in bac_task, after the ack. Mirrors out_modbus's cmd_check(): clear
+ * first so it is a trigger and not a state, then let out_common refuse it. */
+static void cmd_check(void)
+{
+    if (!s_bv_written) return;
+    s_bv_written = false;
+    /* Back to INACTIVE whatever happens next, including a refusal -- the
+     * object says "not running a test", not "a test was asked for". */
+    Binary_Value_Present_Value_Set(SELFTEST_BV, BINARY_INACTIVE);
+
+    if (out_common_request_selftest("BACnet BV1") != ESP_OK) return;
+
+    xSemaphoreTake(s_stat_lock, portMAX_DELAY);
+    s_stat.tests_started++;
+    xSemaphoreGive(s_stat_lock);
+}
+
 static void create_objects(void)
 {
     for (int i = 0; i < OUT_DISCRETE_N; i++) {
@@ -180,6 +289,28 @@ static void create_objects(void)
         Analog_Input_Description_Set(inst, out_common_reg_name(a));
         Analog_Input_Units_Set(inst, u);
     }
+
+    /* The self-test trigger. Created whether or not commands are enabled: a
+     * point that disappears tells a BMS nothing, while a point that is there
+     * and not writable tells it exactly where it stands -- and it keeps one
+     * point list valid across every board. */
+    const uint32_t bv = Binary_Value_Create(SELFTEST_BV);
+    Binary_Value_Name_Set(bv, "Start battery self-test");
+    Binary_Value_Description_Set(bv,
+        "Write Active to start one quick battery self-test. The load runs on "
+        "battery while it does. At most one every 30 minutes.");
+    /* Worth setting: a BMS shows these instead of "Active"/"Inactive", and
+     * "Start test" on a momentary point is the difference between an
+     * operator knowing what a write does and guessing. */
+    Binary_Value_Active_Text_Set(bv, "Start test");
+    Binary_Value_Inactive_Text_Set(bv, "Idle");
+    Binary_Value_Present_Value_Set(bv, BINARY_INACTIVE);
+    Binary_Value_Write_Present_Value_Callback_Set(bv_written);
+    /* Both branches explicitly. Binary_Value_Create() enables writes by
+     * default, and leaning on that would make the opt-in depend on a default
+     * inside vendored code. */
+    if (out_common_cmd_enabled()) Binary_Value_Write_Enable(bv);
+    else                          Binary_Value_Write_Disable(bv);
 }
 
 /* Copies the shared snapshot into the objects. Same cadence and same source
@@ -237,6 +368,8 @@ static void bac_task(void *arg)
             s_stat.last_request_us = esp_timer_get_time();
             xSemaphoreGive(s_stat_lock);
         }
+        /* After npdu_handler, so the ack is already on its way out. */
+        cmd_check();
         if (mstimer_expired(&refresh_timer)) {
             mstimer_reset(&refresh_timer);
             refresh();
@@ -318,11 +451,12 @@ esp_err_t out_bacnet_start(void)
     apdu_set_confirmed_handler(SERVICE_CONFIRMED_READ_PROPERTY, handler_read_property);
     apdu_set_confirmed_handler(SERVICE_CONFIRMED_READ_PROP_MULTIPLE,
                                handler_read_property_multiple);
-    /* WriteProperty is registered on purpose, and answers write-access-denied
-     * for every object we expose, because none has a writable property list.
-     * Leaving it unregistered would answer "service not supported" instead,
-     * which reads to a BMS as a broken device rather than a read-only one --
-     * and the brief's acceptance test asks for the denial. */
+    /* WriteProperty answers write-access-denied for every object except BV1,
+     * which is the only one with a writable property list -- and for BV1 too
+     * when commands are off for this board. Leaving the service unregistered
+     * would answer "service not supported" instead, which reads to a BMS as a
+     * broken device rather than a read-only one, and the brief's acceptance
+     * test asks for the denial. */
     apdu_set_confirmed_handler(SERVICE_CONFIRMED_WRITE_PROPERTY, handler_write_property);
     apdu_set_confirmed_handler(SERVICE_CONFIRMED_DEVICE_COMMUNICATION_CONTROL,
                                handler_device_communication_control);
@@ -353,8 +487,10 @@ esp_err_t out_bacnet_start(void)
              dev_name, (unsigned long)instance,
              out_common_device_id() == OUT_DEVID_DERIVE ? " (derived)" : " (configured)",
              mac, baud, max_master, info_frames, info_frames == 1 ? "" : "s");
-    ESP_LOGI(TAG, "BI1-BI%d from discretes 0-%d, AI from registers (+1), read-only",
-             OUT_DISCRETE_N, OUT_DISCRETE_N - 1);
+    ESP_LOGI(TAG, "BI1-BI%d from discretes 0-%d, AI from registers (+1), read-only; "
+                  "BV%d self-test %s",
+             OUT_DISCRETE_N, OUT_DISCRETE_N - 1, SELFTEST_BV,
+             out_common_cmd_enabled() ? "WRITABLE" : "write-disabled");
     return ESP_OK;
 }
 

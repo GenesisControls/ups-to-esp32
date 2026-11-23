@@ -440,11 +440,13 @@ static esp_err_t get_status(httpd_req_t *req)
         /* BACnet MS/TP. Its counter is NPDUs handled, not Modbus frames. */
         n += snprintf(AT(n), ROOM(n),
                   ",\"mstp\":{\"running\":%s,\"requests\":%u,\"quiet_s\":%lld,"
-                  "\"baud\":%d,\"mac\":%d,\"bytes_tx\":%u,\"bytes_rx\":%u}}",
+                  "\"baud\":%d,\"mac\":%d,\"bytes_tx\":%u,\"bytes_rx\":%u,"
+                  "\"tests\":%u}}",
                   bac.running ? "true" : "false", (unsigned)bac.requests,
                   QUIET(bac.last_request_us),
                   bac.baud, bac.mac,
-                  (unsigned)bac.bytes_tx, (unsigned)bac.bytes_rx);
+                  (unsigned)bac.bytes_tx, (unsigned)bac.bytes_rx,
+                  (unsigned)bac.tests_started);
         #undef QUIET
     }
 #if CONFIG_UPSA_TAILSCALE

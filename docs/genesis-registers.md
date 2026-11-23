@@ -143,9 +143,15 @@ Every address above is read-only and the stack refuses a write with an
 exception — not silently ignored, not accepted-then-reverted.
 
 **Coil 100 is the one exception**: writing it starts one quick battery
-self-test. It is off by default per board and refused unless the UPS's own
-descriptor says it can self-test, at most one per 30 minutes, device-wide.
-Everything else stays read-only.
+self-test. **It is enabled by default**, and refused unless the UPS's own
+descriptor says it can self-test, at most one per 30 minutes. Everything else
+stays read-only.
+
+The rate limit is **per board, not per protocol**: Modbus coil 100 and BACnet
+BV1 reach the same battery, and a board serving MS/TP on the trunk and Modbus
+TCP over Wi-Fi still gets one test per half hour in total. Untick *allow a
+battery self-test to be started from the bus* on the board's own page to refuse
+both.
 
 ---
 
@@ -157,6 +163,10 @@ chip MAC unless one is configured.
 **Object instance = the Modbus address + 1.** One map for both protocols;
 the only arithmetic between them is that BACnet instances conventionally
 start at 1 and Modbus addresses at 0.
+
+That rule covers the point set. The one command on the device is the
+exception: it is **BV1**, not BV101, because it is a command rather than a
+point — see the end of this section.
 
 | Object | Point | | Object | Point |
 |---|---|---|---|---|
@@ -190,10 +200,38 @@ number a trend log would happily plot. **BI6 (Comm OK) is deliberately
 exempt** — the object that reports whether the link is up has to stay
 readable when it is down.
 
-Read-only throughout: no writable objects are compiled in. A WriteProperty
-earns `write-access-denied` rather than `service-not-supported`, so a BMS
-sees a read-only device rather than a broken one. The self-test trigger is
-Modbus coil 100 only; there is no BACnet equivalent.
+### BV1 — the one writable object
+
+| Object | Point | Writable |
+|---|---|---|
+| BV1 | Start battery self-test | **yes**, when enabled on the board |
+
+Writing BV1 **Active** starts one quick battery self-test — the BACnet
+counterpart of Modbus coil 100, with the same guards and the *same* half-hour
+limit shared between them. Its present-value returns to Inactive immediately:
+it is a momentary trigger, not a state, so it never reads as "a test is
+running". Register 9 / AI10 is what reports the result.
+
+A BMS sees `Start test` and `Idle` rather than `Active` and `Inactive`, and the
+object's description says what a write does.
+
+It is a Binary **Value**, not a Binary Output: a BO models a physical output
+this board does not have. It is also not commandable — no priority array, no
+relinquish default — so a plain WriteProperty to present-value is all it takes.
+
+**With self-tests disabled on the board, BV1 is still there and still
+discoverable, but a write to it earns `write-access-denied`** — a refusal the
+BMS can see and log. Modbus cannot manage that: coil 100 is always writable,
+and the refusal is a line in the board's own console that nobody on the trunk
+ever reads.
+
+Present-value is the **only** writable property on BV1. Object name,
+description and out-of-service are refused as well, which is stricter than the
+BACnet stack's own default for a Binary Value.
+
+Every other object is read-only, and a WriteProperty to one earns
+`write-access-denied` rather than `service-not-supported`, so a BMS sees a
+read-only device rather than a broken one.
 
 COV is **not** implemented. Poll the objects.
 

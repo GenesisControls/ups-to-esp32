@@ -94,6 +94,10 @@ everything looks right and nothing works, try 8N2.
 
 Data format is not offered: ANSI/ASHRAE 135 fixes MS/TP at 8N1.
 
+The point set is BI1&ndash;BI11 and AI1&ndash;AI19, read-only, plus **BV1
+&ldquo;Start battery self-test&rdquo;**, which is the only writable object on
+the device. See `genesis-registers.md`.
+
 **Device ID 0 derives it from the chip MAC**, which is the default and the
 right answer for twenty adapters. A fixed default would mean twenty devices
 claiming the same instance — most likely 12345, which is in every vendor's
@@ -204,6 +208,8 @@ Worth knowing before you look for it:
 - **Days since battery change** (register 8, AI9) — reads *not available*.
   It needs a real clock and this board has none yet. Discrete 9, the battery
   age alarm, depends on it and is therefore always false.
-- **Writes of any kind**, apart from the self-test coil, which is off by
-  default.
+- **Writes of any kind**, apart from the self-test trigger — Modbus coil 100
+  or BACnet BV1 — which is **on** by default. One quick test per half hour per
+  board, refused unless the UPS says it can self-test. Untick *allow a battery
+  self-test to be started from the bus* on the RS485 / BMS card to refuse it.
 - **Check-in / telemetry** — compiled out. This board reports to nobody.

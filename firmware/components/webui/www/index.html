@@ -722,10 +722,11 @@ body.locked #menu-btn,body.mkauth #menu-btn{display:none}
 
       <div id="f-cmd">
         <label class="chk"><input type="checkbox" id="bus-cmd"> allow a battery self-test to be started from the bus</label>
-        <p class="note">Writing <b>coil 100</b> starts one quick test &mdash; refused unless the UPS
-          reports it can self-test, and at most one every 30 minutes. Everything else on the bus
-          stays read-only. Modbus only: there is no BACnet equivalent, because this device
-          exposes nothing writable.</p>
+        <p class="note">Writing <b>Modbus coil 100</b>, or <b>BACnet BV1</b> (&ldquo;Start battery
+          self-test&rdquo;), starts one quick test &mdash; refused unless the UPS reports it can
+          self-test, and at most one every 30 minutes however many protocols ask. Everything else
+          on the bus stays read-only. With this unticked, BV1 is still visible to a BMS but reports
+          itself as not writable, and a write to either address is refused.</p>
       </div>
       <button class="btn" id="bus-save">Save</button>
       <button class="btn" id="bus-reboot">Restart board</button>
@@ -2263,7 +2264,7 @@ function busFields(){
     'f-devid' : mstp,              // BACnet identity
     'f-tcpuid': tcp,               // its own, not the RS485 address
     'f-mbport': tcp,
-    'f-cmd'   : rtu||tcp,          // coil 100 is Modbus; BACnet has no equivalent
+    'f-cmd'   : rtu||tcp||mstp,    // Modbus coil 100, BACnet BV1
   };
   for(const g of BUS_GROUPS){ const el=$(g); if(el) el.hidden=!on[g]; }
 
@@ -2376,7 +2377,8 @@ function busUI(b){
     comms+=rows('BACnet MS/TP (RS485)', mstp,
       `<tr><td>Device instance</td><td>${b.devid||0}${b.devid_set===0?' (derived from the MAC)':''}</td></tr>
        <tr><td>Station MAC</td><td>${mstp.mac||0}</td></tr>
-       <tr><td>Bytes</td><td>${mstp.bytes_tx||0} sent · ${mstp.bytes_rx||0} received</td></tr>`);
+       <tr><td>Bytes</td><td>${mstp.bytes_tx||0} sent · ${mstp.bytes_rx||0} received</td></tr>
+       <tr><td>Self-tests started</td><td>${mstp.tests||0}</td></tr>`);
   }
   if(b.tcp_en && tcp.running){
     comms+=rows(`Modbus TCP (port ${tcp.port||b.mbport||502})`, tcp, mbRows(tcp));
