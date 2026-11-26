@@ -119,9 +119,11 @@ register — exactly what gets an engineer to map a 3 onto a 3 and be wrong.
 1–6 are untouched. They belong to the other track and 6 stays *scheduled*
 rather than being reused.
 
-> **This changes the shared map.** Register 9 is published in
-> `ups-modbus-monitoring/README.md`, where it is still marked *planned* and
-> its encoding *provisional*. That track has to be told.
+> **This changes the shared map, and that track has been told.** Register 9
+> is published in `ups-modbus-monitoring/README.md`, where it is still marked
+> *planned* and its encoding *provisional*. The move was applied there on
+> 2026-11-24 — see *Reserved addresses* below for the state of that
+> relay. Don't send it a second time.
 
 #### Register 18 — last restart reason
 
@@ -165,9 +167,9 @@ not noise. Nothing in the UPS's status word reports an alarm sounding — it
 carries `OL OB LB CHRG DISCHRG RB OVER` and no alarm bit — so there is nothing
 to publish. What makes it sound is already on the bus: discretes 1–4.
 
-> **Claimed from the reserved 12–15 range on 2026-11-23.** That range belongs
-> to the shared map, so this needs relaying to `ups-modbus-monitoring` rather
-> than assuming. 13–15 remain reserved.
+> **Claimed from the reserved range on 2026-11-23**, and relayed to
+> `ups-modbus-monitoring` on 2026-11-24 — see *Reserved addresses*
+> below. 14–15 remain reserved.
 
 #### Register 13 — UPS state
 
@@ -206,8 +208,9 @@ go on reporting a test.
 the rules reads 6, not 1 — a summary point that reports calm when it cannot
 tell is the one failure it must not have.
 
-> **Claimed from the reserved range on 2026-11-23**, alongside register 12.
-> Both need relaying to `ups-modbus-monitoring`. 14–15 remain reserved.
+> **Claimed from the reserved range on 2026-11-23**, alongside register 12,
+> and relayed to `ups-modbus-monitoring` on 2026-11-24 — see *Reserved
+> addresses* below. 14–15 remain reserved.
 
 ### Reserved addresses — 14–15 and 19–23
 
@@ -221,6 +224,14 @@ a point sheet from the wrong version; one who sees 65535 has a UPS question.
 
 Registers 14–15 and 19–23 are reserved for future UPS and adapter facts
 respectively. Don't claim one without going through the other track.
+
+**12 and 13 were claimed on 2026-11-23 and relayed on 2026-11-24.** Their
+encodings, and register 9's move of *unknown* from 0 to 7, were applied to
+`ups-modbus-monitoring/README.md` — the authority for the shared map — and
+left **uncommitted** there by decision: that repo has no git history yet, so
+the change is an untracked edit plus a saved diff rather than a commit. The
+numbers are settled either way; don't relay them again.
+`docs/register-map-change-2026-11-23.md` is what went over.
 
 ### Comm-loss behaviour, exactly
 

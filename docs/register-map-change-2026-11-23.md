@@ -10,6 +10,14 @@ Nothing a site reads today moves. **Discretes 0–10 and registers 0–8, 10, 11
 and 16–18 are untouched**, as is register 7's six-bit width and every
 comm-loss convention.
 
+> **Applied 2026-11-24.** All three are in that README, along with a fourth
+> correction made while landing them: its note on register 18 said the adapter
+> publishes `esp_reset_reason_t`, where the firmware publishes that **plus
+> one** (1–16, 1 = unknown), so 18 follows the 1-based rule rather than
+> being an exception to it. Left **uncommitted** there by decision — that
+> repo has no git history yet — so it is an untracked edit plus a saved
+> unified diff, not a commit.
+
 ---
 
 ## Why a BACnet constraint is changing a Modbus number
