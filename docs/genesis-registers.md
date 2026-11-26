@@ -228,9 +228,10 @@ respectively. Don't claim one without going through the other track.
 **12 and 13 were claimed on 2026-11-23 and relayed on 2026-11-24.** Their
 encodings, and register 9's move of *unknown* from 0 to 7, were applied to
 `ups-modbus-monitoring/README.md` — the authority for the shared map — and
-left **uncommitted** there by decision: that repo has no git history yet, so
-the change is an untracked edit plus a saved diff rather than a commit. The
-numbers are settled either way; don't relay them again.
+committed there on 2026-11-26 as `3aa6f25`, on a `track-sync/` branch cut
+from `5cc96fb`, the first commit that repo has ever had. **Nothing is pushed
+and it has no remote**, so both commits are local to the machine that made
+them. The numbers are settled; don't relay them again.
 `docs/register-map-change-2026-11-23.md` is what went over.
 
 ### Comm-loss behaviour, exactly

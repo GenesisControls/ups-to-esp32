@@ -14,9 +14,9 @@ comm-loss convention.
 > correction made while landing them: its note on register 18 said the adapter
 > publishes `esp_reset_reason_t`, where the firmware publishes that **plus
 > one** (1–16, 1 = unknown), so 18 follows the 1-based rule rather than
-> being an exception to it. Left **uncommitted** there by decision — that
-> repo has no git history yet — so it is an untracked edit plus a saved
-> unified diff, not a commit.
+> being an exception to it. Committed there on 2026-11-26 as `3aa6f25`, on a
+> branch cut from `5cc96fb` — the first commit that repo has ever had.
+> **Not pushed, and it has no remote.**
 
 ---
 
