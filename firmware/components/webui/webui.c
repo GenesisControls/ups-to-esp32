@@ -16,6 +16,9 @@
 #include "snmp.h"
 #include "ota.h"
 #include "auth.h"
+#include "out_common.h"
+#include "out_modbus.h"
+#include "out_bacnet.h"
 #include "mbedtls/base64.h"
 #include "nvs.h"
 #include "board.h"
@@ -245,11 +248,12 @@ static esp_err_t get_status(httpd_req_t *req)
 #endif
     n += snprintf(AT(n), ROOM(n),
                   "\"wifi\":{" WIRED_JSON "\"state\":%d,\"rescue\":%s,\"ip\":\"%s\",\"ap\":\"%s\","
-                  "\"ssid\":\"%s\",\"rssi\":%d,",
+                  "\"ssid\":\"%s\",\"rssi\":%d,\"ap_always\":%s,",
                   (int)netmgr_state(), netmgr_rescue() ? "true" : "false",
                   jesc(netmgr_ip(), e1, sizeof(e1)),
                   jesc(netmgr_ap_ssid(), e2, sizeof(e2)),
-                  jesc(netmgr_ssid(), e3, sizeof(e3)), netmgr_rssi());
+                  jesc(netmgr_ssid(), e3, sizeof(e3)), netmgr_rssi(),
+                  netmgr_ap_always_on() ? "true" : "false");
     /* The setup join: its progress, the address it was given and why it
      * failed. The setup page shows the address before the AP goes away,
      * which is the only moment a person can be told it without a router. */
@@ -323,6 +327,7 @@ static esp_err_t get_status(httpd_req_t *req)
                   jesc(crashlog_last(), e1, sizeof(e1)));
     /* The fleet heartbeat: whether it is built in, what the owner allows, and
      * how the last one went. last_ok is seconds ago, -1 if never this boot. */
+#ifndef CONFIG_UPSA_FLEET_DISABLED
     fleet_status_t f;
     fleet_get(&f);
     char desc_res[64];
@@ -331,16 +336,120 @@ static esp_err_t get_status(httpd_req_t *req)
     n += snprintf(AT(n), ROOM(n),
                   "\"fleet\":{\"configured\":%s,\"enabled\":%s,\"stats\":%s,\"stats_auto\":%s,"
                   "\"channel\":\"%s\",\"sent\":%u,\"last_ok\":%lld,\"error\":\"%s\","
-                  "\"desc\":\"%s\"},"
-                  "\"auth\":{\"enabled\":%s}",
+                  "\"desc\":\"%s\"},",
                   f.configured ? "true" : "false", f.enabled ? "true" : "false",
                   f.stats ? "true" : "false", f.stats_auto ? "true" : "false",
                   jesc(f.channel, e2, sizeof(e2)),
                   (unsigned)f.sent,
                   (long long)(f.last_ok_s < 0 ? -1 : now_s - f.last_ok_s),
                   jesc(f.last_error, e1, sizeof(e1)),
-                  jesc(desc_res, e3, sizeof(e3)),
-                  auth_enabled() ? "true" : "false");
+                  jesc(desc_res, e3, sizeof(e3)));
+#endif
+    /* OMITTED ENTIRELY when the check-in is compiled out, which is what makes
+     * its whole card disappear without a line of page code: fleet(s) opens
+     * with "const f = s.fleet; if (!f) return;" and every other reference in
+     * the page guards with s.fleet && ... So no object means no card, no
+     * "Check-in" entry, and no "send this UPS to the developer" card either
+     * -- that one is rendered by fleet() too, and never runs.
+     *
+     * Reporting it as "not configured" was accurate and still wrong for a
+     * Genesis build: it advertised a feature this firmware does not contain,
+     * on a page a customer's staff will read. An upstream build is untouched
+     * and shows the card exactly as before.
+     *
+     * The /api/fleet routes stay registered and are inert -- fleet_start()
+     * returns before creating its task, so nothing can be switched on by
+     * reaching them. Removing them would mean touching ROUTE_COUNT and
+     * upstream's handler table for no behaviour change. */
+    n += snprintf(AT(n), ROOM(n),
+                  "\"auth\":{\"enabled\":%s,\"default\":%s},"
+                  "\"setup_screen\":%s",
+                  auth_enabled() ? "true" : "false",
+                  auth_is_default() ? "true" : "false",
+#if CONFIG_UPSA_SETUP_SCREEN
+                  "true");
+#else
+                  "false");
+#endif
+
+    /* The BMS bus. "ip" is what decides whether the page offers Modbus TCP
+     * and BACnet/IP at all: they need an interface with an address, and the
+     * answer is the network's, not the board type's -- an RS485 board that
+     * joined a Wi-Fi can serve them perfectly well. */
+    {
+        out_modbus_stat_t rtu, tcp;
+        out_modbus_get_rtu(&rtu);
+        out_modbus_get_tcp(&tcp);
+        out_bacnet_stat_t bac;
+        out_bacnet_get(&bac);
+
+        /* THREE OUTPUTS, each reported separately, because up to three run at
+         * once. The old shape had one "running" and one request count, which
+         * cannot describe a board serving BACnet MS/TP on the trunk while
+         * answering Modbus TCP over Wi-Fi.
+         *
+         * Note has485 rather than rs485 for the capability: "rs485" now names
+         * the trunk's PROTOCOL, and leaving the old key meaning "this board
+         * has a transceiver" would have been a silent collision. */
+        const int64_t now = esp_timer_get_time();
+        #define QUIET(us) ((us) ? (long long)((now - (us)) / 1000000) : -1LL)
+
+        n += snprintf(AT(n), ROOM(n),
+                  ",\"bus\":{\"proto\":%d,\"tcp_en\":%s,"
+                  "\"has485\":%s,\"ip\":%s,"
+                  "\"address\":%d,\"baud\":%d,\"format\":%d,\"cmd\":%s,\"deep\":%s,"
+                  "\"devid\":%lu,\"devid_set\":%lu,\"devname\":\"%s\","
+                  "\"infofr\":%d,\"maxmast\":%d,\"mbport\":%d,\"tcpuid\":%d",
+                  (int)out_common_proto(),
+                  out_common_tcp_enabled() ? "true" : "false",
+                  BOARD_HAS_RS485 ? "true" : "false",
+                  netmgr_state() == NETMGR_STA_CONNECTED ? "true" : "false",
+                  out_common_address(), out_common_baud(),
+                  (int)out_common_format(),
+                  out_common_cmd_enabled() ? "true" : "false",
+                  out_common_deep_enabled() ? "true" : "false",
+                  (unsigned long)(bac.instance ? bac.instance : out_common_device_id()),
+                  (unsigned long)out_common_device_id(),
+                  jesc(bac.device_name, e1, sizeof(e1)),
+                  out_common_info_frames(), out_common_max_master(),
+                  out_common_mb_tcp_port(), out_common_tcp_uid());
+
+        /* Modbus RTU on the trunk. collisions and the per-access read counts
+         * live here because they are serial facts. */
+        n += snprintf(AT(n), ROOM(n),
+                  ",\"rtu\":{\"running\":%s,\"requests\":%u,\"quiet_s\":%lld,"
+                  "\"per_min\":%u,\"collisions\":%u,\"writes\":%u,\"tests\":%u,"
+                  "\"baud\":%d,\"format\":\"%s\",\"rd\":[%u,%u,%u,%u]}",
+                  rtu.running ? "true" : "false", (unsigned)rtu.requests, QUIET(rtu.last_request_us),
+                  (unsigned)rtu.per_min, (unsigned)rtu.collisions,
+                  (unsigned)rtu.writes_refused, (unsigned)rtu.tests_started,
+                  rtu.baud, rtu.format ? rtu.format : "",
+                  (unsigned)rtu.rd_input, (unsigned)rtu.rd_holding,
+                  (unsigned)rtu.rd_discrete, (unsigned)rtu.rd_coil);
+
+        /* Modbus TCP. No collisions on a socket. */
+        n += snprintf(AT(n), ROOM(n),
+                  ",\"tcp\":{\"running\":%s,\"requests\":%u,\"quiet_s\":%lld,"
+                  "\"per_min\":%u,\"writes\":%u,\"tests\":%u,\"port\":%d,"
+                  "\"rd\":[%u,%u,%u,%u]}",
+                  tcp.running ? "true" : "false", (unsigned)tcp.requests, QUIET(tcp.last_request_us),
+                  (unsigned)tcp.per_min, (unsigned)tcp.writes_refused,
+                  (unsigned)tcp.tests_started, tcp.port,
+                  (unsigned)tcp.rd_input, (unsigned)tcp.rd_holding,
+                  (unsigned)tcp.rd_discrete, (unsigned)tcp.rd_coil);
+
+        /* BACnet MS/TP. Its counter is NPDUs handled, not Modbus frames. */
+        n += snprintf(AT(n), ROOM(n),
+                  ",\"mstp\":{\"running\":%s,\"requests\":%u,\"quiet_s\":%lld,"
+                  "\"baud\":%d,\"mac\":%d,\"bytes_tx\":%u,\"bytes_rx\":%u,"
+                  "\"tests\":%u}}",
+                  bac.running ? "true" : "false", (unsigned)bac.requests,
+                  QUIET(bac.last_request_us),
+                  bac.baud, bac.mac,
+                  (unsigned)bac.bytes_tx, (unsigned)bac.bytes_rx,
+                  (unsigned)bac.tests_started);
+        #undef QUIET
+    }
 #if CONFIG_UPSA_TAILSCALE
     /* Present only in a Tailscale build, so the page can tell "not in this
      * firmware" from "off". key_set, never the key: this JSON is served to
@@ -853,12 +962,22 @@ static esp_err_t post_wifi(httpd_req_t *req)
         cJSON_Delete(root);
         return send_err(req, "choose a username and password for this board");
     }
-    /* Everything else is checked before the login is committed: it is saved
+    /* A NETWORK NAME IS OPTIONAL ON THIS BUILD. Upstream requires one here,
+     * and is right to: for upstream the network IS the product -- NUT on
+     * 3493, Home Assistant, Prometheus. For this adapter it is the exception.
+     * The output that matters is RS485, the radio exists so a technician can
+     * configure the board, and roughly one deployment in twenty ever joins a
+     * network (to carry Modbus TCP or BACnet/IP over Wi-Fi).
+     *
+     * So a save with no SSID is valid: it stores the login and leaves the
+     * board on its own AP. Static IP settings are not applied on this path --
+     * they only mean anything once the board joins something, and /api/network
+     * is where they belong.
+     *
+     * Everything else is checked before the login is committed: it is saved
      * once, so a retry with a corrected form would be silently ignored. */
-    if (!cJSON_IsString(ssid) || !ssid->valuestring[0]) {
-        cJSON_Delete(root);
-        return send_err(req, "a network name is required");
-    }
+    const bool want_wifi = cJSON_IsString(ssid) && ssid->valuestring[0];
+
     bool made_login = false;
     if (au && au[0] && !auth_enabled()) {
         esp_err_t aerr = auth_set_credentials(au, ap);
@@ -875,6 +994,18 @@ static esp_err_t post_wifi(httpd_req_t *req)
     }
 
     bool setup = netmgr_state() == NETMGR_AP_PROVISIONING;
+
+    /* No network asked for: the login is already saved, the board stays on
+     * its own access point and nothing restarts. Not an error -- it is the
+     * normal outcome for this product. */
+    if (!want_wifi) {
+        cJSON_Delete(root);
+        ESP_LOGI(TAG, "setup saved with no network: staying on the access point");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_send(req, "{\"ok\":true,\"no_wifi\":true}",
+                               HTTPD_RESP_USE_STRLEN);
+    }
+
     esp_err_t err = netmgr_provision(ssid->valuestring,
                                      cJSON_IsString(pass) ? pass->valuestring : "", &ip);
     cJSON_Delete(root);
@@ -1118,6 +1249,291 @@ static esp_err_t post_ota_install(httpd_req_t *req)
     return httpd_resp_send(req, err == ESP_OK ? "{\"ok\":true}"
                            : "{\"ok\":false,\"error\":\"busy\"}",
                            HTTPD_RESP_USE_STRLEN);
+}
+
+/* GET /api/points -- every address this device serves, with what it reads
+ * right now.
+ *
+ * The commissioning view: an engineer ticks this against the Niagara point
+ * sheet instead of guessing. RAW values, because raw is what a BMS reads --
+ * register 3 showing 2401 is how you confirm Niagara renders 240.1 V.
+ *
+ * Its own endpoint rather than part of /api/status: thirty-five values on
+ * every one-second poll would be paid for by every page, and this one is
+ * fetched only while its card is open. Sent in chunks so it needs no buffer
+ * big enough to hold the lot.
+ *
+ * A reserved address appears with a null value and no name. That is the
+ * point of showing it: absent is a different answer from 65535, and this is
+ * where a site can see which is which. */
+static esp_err_t get_points(httpd_req_t *req)
+{
+    if (!may_read(req)) return ESP_OK;
+    out_points_t p;
+    out_common_get(&p);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr_chunk(req, "{\"ok\":true,\"comm_ok\":");
+    httpd_resp_sendstr_chunk(req, p.comm_ok ? "true" : "false");
+    httpd_resp_sendstr_chunk(req, ",\"discretes\":[");
+    for (int i = 0; i < OUT_DISCRETE_N; i++) {
+        char b[112];
+        snprintf(b, sizeof(b), "%s{\"a\":%d,\"n\":\"%s\",\"v\":%s}",
+                 i ? "," : "", i, out_common_discrete_name(i),
+                 p.discrete[i] ? "true" : "false");
+        httpd_resp_sendstr_chunk(req, b);
+    }
+    httpd_resp_sendstr_chunk(req, "],\"regs\":[");
+    for (int i = 0; i < OUT_REG_N; i++) {
+        char b[144];
+        if (p.reg_live[i]) {
+            snprintf(b, sizeof(b), "%s{\"a\":%d,\"n\":\"%s\",\"u\":\"%s\",\"v\":%u}",
+                     i ? "," : "", i, out_common_reg_name(i),
+                     out_common_reg_unit(i), (unsigned)p.reg[i]);
+        } else {
+            snprintf(b, sizeof(b), "%s{\"a\":%d,\"n\":\"\",\"u\":\"\",\"v\":null}",
+                     i ? "," : "", i);
+        }
+        httpd_resp_sendstr_chunk(req, b);
+    }
+    httpd_resp_sendstr_chunk(req, "]}");
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
+}
+
+/* POST /api/ota/upload -- the firmware image itself as the request body.
+ *
+ * The update path for a board that will never reach the internet, which is
+ * most of them: a laptop on the board's own access point and a .bin file.
+ * /api/ota/install fetches from GitHub and is no use without a route to it.
+ *
+ * Raw bytes, not multipart. A multipart parser here would be attacker-shaped
+ * input immediately upstream of the flash writer, for no gain: the page can
+ * send the File object as the body just as easily. Content-Length is required
+ * so the size can be checked before the slot is opened and so there is
+ * something to show a progress bar.
+ *
+ * Every safety check lives in ota_upload_*(), alongside the download's. */
+static esp_err_t post_ota_upload(httpd_req_t *req)
+{
+    if (!may_write(req)) return ESP_OK;
+    if (req->content_len <= 0) return send_err(req, "no firmware image in the request");
+
+    char err[128] = "";
+    ota_upload_t *u = NULL;
+    if (ota_upload_begin(&u, (size_t)req->content_len, err, sizeof(err)) != ESP_OK) {
+        return send_err(req, err[0] ? err : "could not start the update");
+    }
+
+    /* Off the stack: this runs on an httpd worker and the flash writer below
+     * it is the deepest call this server makes. */
+    enum { UP_BUF = 4096 };
+    char *buf = malloc(UP_BUF);
+    if (!buf) { ota_upload_abort(u); return send_err(req, "out of memory"); }
+
+    size_t left = (size_t)req->content_len;
+    int stalls = 0;
+    esp_err_t rc = ESP_OK;
+    while (left) {
+        int r = httpd_req_recv(req, buf, left < UP_BUF ? left : UP_BUF);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            /* A phone on a weak access point stalls and comes back; a peer
+             * that has gone away does not. Allow a few, then stop rather than
+             * hold the UPS link muted waiting for someone who left. */
+            if (++stalls <= 10) continue;
+            strlcpy(err, "the upload stalled", sizeof(err));
+            rc = ESP_FAIL; break;
+        }
+        if (r <= 0) {
+            strlcpy(err, "the upload was cut short", sizeof(err));
+            rc = ESP_FAIL; break;
+        }
+        stalls = 0;
+        if ((rc = ota_upload_chunk(u, buf, (size_t)r, err, sizeof(err))) != ESP_OK) break;
+        left -= (size_t)r;
+    }
+    free(buf);
+
+    if (rc == ESP_OK) rc = ota_upload_finish(u, err, sizeof(err));
+    ota_upload_abort(u);        /* always, success included: see ota.h */
+
+    if (rc != ESP_OK) return send_err(req, err[0] ? err : "the image was refused");
+    ESP_LOGW(TAG, "firmware uploaded from the page; waiting for a restart");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true,\"installed\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+/* One optional integer from the body, or the value already in force, so a
+ * partial POST changes only what it mentions. */
+#define BUS_INT(root, name, fallback)                                          \
+    (cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive((root), (name)))           \
+         ? cJSON_GetObjectItemCaseSensitive((root), (name))->valueint           \
+         : (fallback))
+
+/* Applies one optional integer setting, stopping at the first refusal.
+ *
+ * The two failures are told apart on purpose. Every setter answers
+ * ESP_ERR_INVALID_ARG for a value out of range and passes anything else
+ * straight up from NVS, so reporting one message for both told a site its
+ * port must be 1-65535 when the port was 502 and the write had failed. The
+ * range message is now only ever shown when the range really was the
+ * problem. */
+#define BUS_SET(root, name, call, msg)                                         \
+    do {                                                                       \
+        const cJSON *jj = cJSON_GetObjectItemCaseSensitive((root), (name));    \
+        if (!why && cJSON_IsNumber(jj)) {                                      \
+            const esp_err_t e_ = (call);                                       \
+            if (e_ == ESP_ERR_INVALID_ARG) why = (msg);                        \
+            else if (e_ != ESP_OK)                                             \
+                why = "the value was accepted but could not be stored "        \
+                      "(settings memory). Try a factory reset.";               \
+        }                                                                      \
+    } while (0)
+
+/* The bus settings. Which protocol is on the trunk, and everything a site
+ * actually changes about it.
+ *
+ * Nothing is started or stopped here. An output holding a UART cannot be
+ * swapped under a live trunk safely, and a BMS watching a device disappear
+ * mid-poll logs a fault; the page asks for a restart instead, which is one
+ * clean transition rather than two messy ones. */
+static esp_err_t post_bus(httpd_req_t *req)
+{
+    if (!may_write(req)) return ESP_OK;
+    char body[384];                 /* nine fields now, not three */
+    if (read_body(req, body, sizeof(body)) < 0) return ESP_FAIL;
+    cJSON *root = cJSON_Parse(body);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "not JSON"); return ESP_FAIL; }
+
+    const char *why = NULL;
+
+    /* PROTOCOL AND ADDRESS ARE CHECKED AS A PAIR, before anything is stored.
+     * The legal address range depends on the protocol -- 1-247 for Modbus,
+     * 0-127 for an MS/TP master -- so checking them one after the other makes
+     * a perfectly legal combination succeed or fail depending on which field
+     * happened to be validated first, and can leave the board half-changed
+     * when the second is refused. Switching to MS/TP with address 200 stored
+     * is the case that matters: refuse it and say why, rather than clamp to
+     * something the BMS is not polling. */
+    /* ONE PRIMARY PROTOCOL, plus an independent Modbus TCP switch.
+     *
+     * The three primaries are mutually exclusive for two different reasons
+     * -- RTU and MS/TP share the UART, MS/TP and BACnet/IP share
+     * bacnet-stack's single Datalink_Transport -- and are therefore one
+     * field. Modbus TCP shares nothing with them but the point set, so it is
+     * a switch rather than a fourth option. */
+    const int want_proto = BUS_INT(root, "proto", (int)out_common_proto());
+    const int want_addr  = BUS_INT(root, "address", out_common_address());
+    const cJSON *jtcp = cJSON_GetObjectItemCaseSensitive(root, "tcp_en");
+    const bool want_tcp = cJSON_IsBool(jtcp) ? cJSON_IsTrue(jtcp)
+                                             : out_common_tcp_enabled();
+
+    if (want_proto != OUT_PROTO_NONE && want_proto != OUT_PROTO_MODBUS_RTU &&
+        want_proto != OUT_PROTO_BACNET_MSTP && want_proto != OUT_PROTO_BACNET_IP) {
+        /* Modbus TCP is not a value here: a caller sending 4 is using the
+         * old shape, where this field held every protocol. */
+        why = "the protocol must be Modbus RTU, BACnet MS/TP, BACnet/IP or none";
+    } else if (want_proto == OUT_PROTO_BACNET_IP) {
+        /* Out of scope for this board, decided 2026-11-22, so this is a
+         * final answer rather than a "not yet": no BIP datalink is compiled
+         * and none is planned here. The enum member survives only for
+         * out_common_proto_name() and the NVS migration path. */
+        why = "this firmware does not serve BACnet/IP";
+    } else if ((want_proto == OUT_PROTO_MODBUS_RTU ||
+                want_proto == OUT_PROTO_BACNET_MSTP) && !BOARD_HAS_RS485) {
+        why = "this board has no RS485 transceiver";
+    } else if (!out_common_address_valid(want_addr, (out_proto_t)want_proto)) {
+        /* The RS485 address, judged against the RS485 protocol. Modbus TCP's
+         * unit id is a separate field with its own validation and is not
+         * constrained by this at all. */
+        why = (want_proto == OUT_PROTO_BACNET_MSTP)
+                  ? "a BACnet MS/TP MAC must be 0-127"
+                  : "a Modbus address must be 1-247";
+    }
+
+    /* ORDER MATTERS: the protocol goes in FIRST.
+     *
+     * out_common_set_address() validates against the protocol in force, so
+     * writing the address first lets the OLD protocol judge the NEW address
+     * -- changing MS/TP (MAC 100) to Modbus RTU (address 200) would pass the
+     * pair check above and then be refused by the setter, because MS/TP's
+     * 0-127 limit still applied at that moment. */
+    if (!why && out_common_set_proto((out_proto_t)want_proto) != ESP_OK) {
+        why = "could not save the protocol";
+    }
+    if (!why && out_common_set_address(want_addr) != ESP_OK) {
+        why = "could not save the address";
+    }
+    if (!why && out_common_set_tcp_enabled(want_tcp) != ESP_OK) {
+        why = "could not save the Modbus TCP setting";
+    }
+
+    BUS_SET(root, "baud", out_common_set_baud(jj->valueint),
+            "baud must be 0 (auto), 9600, 19200, 38400, 57600, 76800 or 115200");
+    BUS_SET(root, "format", out_common_set_format((out_fmt_t)jj->valueint),
+            "data format must be 8N1, 8E1, 8O1 or 8N2");
+    BUS_SET(root, "devid", out_common_set_device_id((uint32_t)jj->valueint),
+            "the device ID must be 0 (derive from the MAC) or up to 4194303");
+    BUS_SET(root, "infofr", out_common_set_info_frames(jj->valueint),
+            "max info frames must be 1-255");
+    BUS_SET(root, "maxmast", out_common_set_max_master(jj->valueint),
+            "max master must be 0-127");
+    BUS_SET(root, "mbport", out_common_set_mb_tcp_port(jj->valueint),
+            "the Modbus TCP port must be 1-65535");
+    BUS_SET(root, "tcpuid", out_common_set_tcp_uid(jj->valueint),
+            "the Modbus TCP unit id must be 0 (answer any) or 1-247");
+
+    const cJSON *jc = cJSON_GetObjectItemCaseSensitive(root, "cmd");
+    if (!why && cJSON_IsBool(jc) &&
+        out_common_set_cmd_enabled(cJSON_IsTrue(jc)) != ESP_OK) {
+        why = "could not save the command setting";
+    }
+    const cJSON *jd = cJSON_GetObjectItemCaseSensitive(root, "deep");
+    if (!why && cJSON_IsBool(jd) &&
+        out_common_set_deep_enabled(cJSON_IsTrue(jd)) != ESP_OK) {
+        why = "could not save the deep-test setting";
+    }
+
+    cJSON_Delete(root);
+    if (why) return send_err(req, why);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true,\"restart\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+/* {"always":true|false} -- hold the setup access point up for good, or go back
+ * to the idle window.
+ *
+ * Its own route rather than a field on /api/wifi: that one joins a network and
+ * returns while the join is in flight, and this is about the radio staying up
+ * when there is no network to join. netmgr applies it immediately in both
+ * directions and persists it, so there is nothing to restart. */
+static esp_err_t post_radio(httpd_req_t *req)
+{
+    if (!may_write(req)) return ESP_OK;
+    char body[64];
+    if (read_body(req, body, sizeof(body)) < 0) return ESP_FAIL;
+    cJSON *root = cJSON_Parse(body);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "not JSON"); return ESP_FAIL; }
+    const cJSON *ja = cJSON_GetObjectItemCaseSensitive(root, "always");
+    esp_err_t e = cJSON_IsBool(ja) ? netmgr_set_ap_always_on(cJSON_IsTrue(ja))
+                                   : ESP_ERR_INVALID_ARG;
+    cJSON_Delete(root);
+    if (e == ESP_ERR_NOT_SUPPORTED) return send_err(req, "this board has no setup access point");
+    if (e == ESP_ERR_INVALID_ARG)   return send_err(req, "always must be true or false");
+    if (e != ESP_OK)                return send_err(req, "could not save the setting");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+/* Approves a trial image now. See ota_confirm_now(): the automatic gate waits
+ * five minutes to infer that the board works, and this is a person who can
+ * see that it does. Behind may_write(), so it is the owner's call. */
+static esp_err_t post_ota_confirm(httpd_req_t *req)
+{
+    if (!may_write(req)) return ESP_OK;
+    if (!ota_confirm_now()) return send_err(req, "could not confirm the running image");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
 /* Turns the periodic CHECK on or off. There is deliberately no equivalent for
@@ -1732,7 +2148,12 @@ static esp_err_t route(httpd_req_t *req)
 #else
 #define ROUTES_TLS 0
 #endif
-#define ROUTE_COUNT (30 + ROUTES_TAILSCALE + ROUTES_OUTAGELOG + ROUTES_HISTORY + ROUTES_TLS)
+/* 35, not 30: /api/ota/upload, /api/bus, /api/points, /api/radio and
+ * /api/ota/confirm are ours (local firmware upload for a board with no route
+ * to GitHub, the BMS bus settings, the register overview, the setup-AP
+ * override, and approving a trial image by hand). The static assert below is
+ * what caught the omission, twice. */
+#define ROUTE_COUNT (35 + ROUTES_TAILSCALE + ROUTES_OUTAGELOG + ROUTES_HISTORY + ROUTES_TLS)
 
 /* Order matters: the server tries these in turn and the wildcard route
  * matches everything, so it has to be last or it swallows the API. */
@@ -1749,6 +2170,11 @@ static const struct { const char *uri; httpd_method_t method; handler_fn fn; } R
     { "/api/ota/notes",        HTTP_GET,  get_ota_notes },
     { "/api/ota/check",        HTTP_POST, post_ota_check },
     { "/api/ota/install",      HTTP_POST, post_ota_install },
+    { "/api/ota/upload",       HTTP_POST, post_ota_upload },
+    { "/api/bus",              HTTP_POST, post_bus },
+    { "/api/radio",            HTTP_POST, post_radio },
+    { "/api/ota/confirm",      HTTP_POST, post_ota_confirm },
+    { "/api/points",           HTTP_GET,  get_points },
     { "/api/ota/auto",         HTTP_POST, post_ota_auto },
     { "/api/fleet",            HTTP_POST, post_fleet },
     { "/api/fleet/descriptor", HTTP_POST, post_fleet_descriptor },

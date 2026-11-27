@@ -110,6 +110,73 @@
 #error "Rev B needs sdkconfig.defaults.revb: 16 MB flash and octal PSRAM (see that file)"
 #endif
 
+#elif defined(CONFIG_UPSA_BOARD_WAVESHARE_RS485)
+
+/* The Genesis Controls UPS->BMS adapter. Same UPS reading as every board
+ * here; the output is an isolated RS485 trunk to a building management
+ * system, and most units never join a network at all. */
+#define BOARD_NAME              "Genesis UPS-BMS adapter (Waveshare RS485-CAN)"
+#define BOARD_OTA_TARGET        "genesis-rs485"
+#define BOARD_IMAGE_NAME        "ups-genesis-rs485"
+
+/* No load switch. The USB-C is a device port -- 5.1k CC pull-downs, VBUS fed
+ * INTO the board through a Schottky -- so the UPS takes its 5 V from outside
+ * and a wedged UPS is recovered by closing and re-enumerating it, the path a
+ * self-powered UPS takes on Rev A anyway.
+ *
+ * Waveshare's own warning, worth repeating where someone will read it: do NOT
+ * power the 7-36 V screw terminal and the USB-C at the same time. */
+#define BOARD_PIN_VBUS_EN       GPIO_NUM_NC
+#define BOARD_PIN_VBUS_FAULT    GPIO_NUM_NC
+
+/* PWR, RS485 and CAN each have an LED, all wired to the supply or the
+ * transceiver lines rather than to a GPIO. Good for watching trunk traffic at
+ * the bench, useless as a status indicator, so the board reports none. */
+#define BOARD_PIN_LED_STATUS    GPIO_NUM_NC
+#define BOARD_PIN_LED_FAULT     GPIO_NUM_NC
+
+/* The board carries a PCF85063 RTC and an SH1.0 battery header, but which
+ * GPIOs its I2C runs on is NOT established -- Waveshare's demo does not touch
+ * it and the wiki's pin table is an image. Left unconnected rather than
+ * guessed; nothing uses I2C on this board today (no display). Worth settling
+ * if we ever drive the RTC, which is the obvious way to make register 8 --
+ * days since battery change -- work on a board with no network and so no
+ * clock. */
+#define BOARD_PIN_I2C_SDA       GPIO_NUM_NC
+#define BOARD_PIN_I2C_SCL       GPIO_NUM_NC
+#define BOARD_PIN_FACTORY_BTN   GPIO_NUM_0   /* BOOT, as on every S3 board */
+#define BOARD_HAS_VBUS_SWITCH   0
+#define BOARD_HAS_VBUS_FAULT    0
+#define BOARD_HAS_STATUS_LEDS   0
+
+/* RS485. From Waveshare's own demo (Arduino/examples/MAIN_WIFI_STA/WS_GPIO.h),
+ * which is the only machine-readable source for this board's pin map.
+ *
+ * THE DRIVER ENABLE IS THE UART'S HARDWARE RTS, not a pin software toggles:
+ * WS_RS485.cpp does setPins(-1,-1,-1,TXD1EN) and then
+ * UART_MODE_RS485_HALF_DUPLEX. An output layer that keys DE itself is racing
+ * the shift register -- it clips frames at the wire while everything on the
+ * board still looks right, which is about the worst failure to diagnose on a
+ * live trunk. Use the mode and let the peripheral do it. */
+#define BOARD_HAS_RS485         1
+#define BOARD_RS485_UART        1            /* UART_NUM_1 */
+#define BOARD_PIN_RS485_TX      GPIO_NUM_17
+#define BOARD_PIN_RS485_RX      GPIO_NUM_18
+#define BOARD_PIN_RS485_DE      GPIO_NUM_21  /* hardware RTS, not a GPIO toggle */
+
+/* CAN (TWAI) is fitted and deliberately unused: emulating Belimo's CAN
+ * gas-detection protocol was rejected as proprietary and part of a UL 2075
+ * listed system. Recorded so the pins are known to be spoken for. */
+#define BOARD_PIN_CAN_TX        GPIO_NUM_15
+#define BOARD_PIN_CAN_RX        GPIO_NUM_16
+
+/* ESP32-S3R8 plus 16 MB external flash: Rev B's memory profile, so it loads
+ * Rev B's settings. Without them the image is laid out for 4 MB and no PSRAM,
+ * and the outage log, history and HTTPS this board is sized for are missing. */
+#if !defined(CONFIG_ESPTOOLPY_FLASHSIZE_16MB) || !defined(CONFIG_SPIRAM_MODE_OCT)
+#error "Waveshare RS485-CAN needs sdkconfig.defaults.revb first: 16 MB flash and octal PSRAM"
+#endif
+
 #elif defined(CONFIG_UPSA_BOARD_DEV_S3) || defined(CONFIG_UPSA_BOARD_DEV_S3_PSRAM)
 
 /* A generic ESP32-S3 board, flashed by its owner. Nothing here is known about
@@ -159,6 +226,12 @@
  * unchanged -- BOARD_PIN_I2C_* still describe them -- only the display swaps. */
 #define BOARD_OLED_SDA          BOARD_PIN_I2C_SCL
 #define BOARD_OLED_SCL          BOARD_PIN_I2C_SDA
+#endif
+
+/* Boards with no RS485 transceiver, which is every one but the Waveshare
+ * adapter. Application code tests BOARD_HAS_RS485, never the board choice. */
+#ifndef BOARD_HAS_RS485
+#define BOARD_HAS_RS485 0
 #endif
 
 /* The pins the DISPLAY uses for SDA and SCL. The board's own I2C nets, unless

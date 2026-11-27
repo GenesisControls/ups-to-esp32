@@ -1,5 +1,5 @@
 idf_component_register(
     SRCS "main.c"
     INCLUDE_DIRS "."
-    REQUIRES board netmgr ups_hid nut_server snmp webui display tailnet outagelog history nvs_flash fleet crashlog auth esp_driver_uart app_update
+    REQUIRES board netmgr ups_hid nut_server snmp webui display tailnet outagelog history nvs_flash fleet crashlog auth esp_driver_uart app_update out_common out_modbus out_bacnet
 )

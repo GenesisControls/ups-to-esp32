@@ -111,6 +111,36 @@ void ota_get_notes(char *tag, size_t tag_cap, char *url, size_t url_cap,
 esp_err_t ota_check(void);              /* ask GitHub, non-blocking */
 esp_err_t ota_install(void);            /* download and write, non-blocking */
 
+/* LOCAL UPLOAD: the same install, fed from an HTTP request body instead of a
+ * GitHub release.
+ *
+ * Why this exists. ota_install() fetches from api.github.com, which is the
+ * right answer for a board on someone's LAN and no answer at all for this
+ * adapter: its output is RS485 and most units never join a network, so the
+ * only machine that can ever reach them is a laptop on the board's own access
+ * point. Without this, those boards could never be updated after leaving the
+ * bench without a USB cable and the BOOT/RESET dance.
+ *
+ * Everything that makes the download safe is shared, because it is the same
+ * code underneath: the image goes to the slot that is not running, its
+ * descriptor is checked against BOARD_IMAGE_NAME before a byte is committed,
+ * the UPS's USB goes quiet for the write, and the new image boots on trial and
+ * is rolled back by the bootloader unless it earns ota_confirm().
+ *
+ * Call begin once, chunk until the body is spent, then finish -- and then
+ * ota_upload_abort() ALWAYS, success or failure. It closes anything still
+ * open, unmutes the UPS link and frees the handle. One rule, so there is no
+ * path that leaves the USB quiet for ever and none that frees twice. `err`
+ * receives a sentence fit to show a person. NOTHING REBOOTS HERE:
+ * on success the state is OTA_INSTALLED and a person presses Restart, exactly
+ * as after a download. */
+typedef struct ota_upload ota_upload_t;
+esp_err_t ota_upload_begin(ota_upload_t **out, size_t total, char *err, size_t cap);
+esp_err_t ota_upload_chunk(ota_upload_t *u, const void *data, size_t len,
+                           char *err, size_t cap);
+esp_err_t ota_upload_finish(ota_upload_t *u, char *err, size_t cap);
+void      ota_upload_abort(ota_upload_t *u);   /* only for a caller-side failure */
+
 /* Permit or forbid the periodic check. Stored in NVS, so it survives a reboot
  * and an update. Installing still needs a person either way. */
 esp_err_t ota_set_auto_check(bool enabled);
@@ -151,6 +181,20 @@ void      ota_tls_give(void);
  * request killed it -- cancelling the rollback that existed to catch exactly
  * that. Associating proves the radio works, nothing more. */
 bool      ota_confirm(void);
+
+/* Confirms a trial image NOW, on a person's word, and cancels the rollback.
+ *
+ * ota_confirm() above earns it with five minutes of uptime and three served
+ * requests, which is a proxy for "a human would be able to tell this works".
+ * When there IS a human, looking at a working page and pressing a button,
+ * the proxy is redundant: the request that carries this one has already
+ * proved the web server registers its handlers and answers, which is exactly
+ * what the two bugs this gate was built for would have failed.
+ *
+ * Returns true once the image is confirmed, or was never on trial. It does
+ * not wait and it does not second-guess the caller -- the judgement is the
+ * person's, and the only thing it refuses is nothing at all. */
+bool      ota_confirm_now(void);
 
 /* Evidence that the web server is not merely listening but answering. Called
  * by the HTTP layer on each completed request. */

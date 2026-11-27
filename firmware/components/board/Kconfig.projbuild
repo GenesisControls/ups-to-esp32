@@ -58,6 +58,28 @@ config UPSA_BOARD_DEV_S3
         4 MB partition table, so it runs on 4, 8 and 16 MB parts, with or
         without PSRAM (PSRAM is left unused).
 
+config UPSA_BOARD_WAVESHARE_RS485
+    bool "Waveshare ESP32-S3-RS485-CAN (Genesis UPS->BMS adapter)"
+    help
+        The Genesis Controls adapter: a Waveshare ESP32-S3-RS485-CAN carrying
+        an ESP32-S3R8 (8 MB octal PSRAM) and 16 MB flash, so it takes Rev B's
+        flash layout and memory settings. Build it with
+        sdkconfig.defaults.revb, then sdkconfig.defaults.waveshare-rs485,
+        then sdkconfig.defaults.genesis.
+
+        Its job is not Rev A's. The UPS reading is the same, but the output
+        is an isolated RS485 trunk speaking Modbus RTU or BACnet MS/TP to a
+        building management system, and most units never join a network at
+        all -- the radio exists so a technician can open the page. Pins are
+        from Waveshare's own demo (WS_GPIO.h): RS485 on UART1 TX 17, RX 18,
+        driver-enable 21 as hardware RTS; CAN on 15/16, deliberately unused.
+
+        NO VBUS LOAD SWITCH. The USB-C is a device port, so 5 V reaches the
+        UPS from outside the board and a wedged UPS is recovered by closing
+        and re-enumerating it, as on a dev board. NOTE Waveshare's own
+        warning: do not power the screw terminal and the USB-C at the same
+        time.
+
 config UPSA_BOARD_DEV_S3_PSRAM
     bool "ESP32-S3 dev board, N16R8 (build from source)"
     help
@@ -77,6 +99,8 @@ config UPSA_BOARD_PSRAM_CLASS
     bool
     default y if UPSA_BOARD_REV_B
     default y if UPSA_BOARD_DEV_S3_PSRAM
+    # ESP32-S3R8 plus 16 MB flash: Rev B's memory profile on another PCB.
+    default y if UPSA_BOARD_WAVESHARE_RS485
 
 # The network is wired Ethernet instead of Wi-Fi. Not user-visible: a fact about
 # the board. Boards without a radio cannot offer a setup access point either.

@@ -338,6 +338,14 @@ const char *netmgr_hostname(void) { return s_host; }
 
 /* Nothing here is wireless. The page already hides what is empty. */
 const char *netmgr_ap_ssid(void) { return ""; }
+
+/* No radio on a wired board, so there is no setup AP and no window over it.
+ * These exist because main.c calls netmgr_ap_reopen() on a BOOT press and
+ * netmgr.h is the one header both implementations answer to. */
+void netmgr_ap_reopen(void) { }
+int  netmgr_ap_window_left_s(void) { return -1; }
+bool netmgr_ap_always_on(void) { return false; }
+esp_err_t netmgr_set_ap_always_on(bool on) { (void)on; return ESP_ERR_NOT_SUPPORTED; }
 const char *netmgr_ssid(void) { return ""; }
 int netmgr_rssi(void) { return 0; }
 int netmgr_scan(netmgr_ap_t *out, int max) { return -1; }

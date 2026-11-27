@@ -127,6 +127,35 @@ typedef struct {
 int netmgr_scan(netmgr_ap_t *out, int max);
 
 /* Wipe stored credentials and reboot into SoftAP provisioning. */
+/* THE SETUP AP'S WINDOW (CONFIG_UPSA_AP_WINDOW_S, 0 = never close).
+ *
+ * A board that never joins a network would otherwise broadcast an open access
+ * point for its whole service life. With a window set it closes the radio --
+ * esp_wifi_stop(), not a hidden SSID -- once the window has run with nobody
+ * associated, and the only ways back are physical: BOOT, or a power cycle.
+ * Both work with the network down, which is the point.
+ *
+ * netmgr_ap_reopen() turns it back on, or buys another full window if it is
+ * still up. main.c calls it on any BOOT press; the five-press factory reset
+ * is counted separately and still happens.
+ *
+ * netmgr_ap_window_left_s() is seconds remaining, 0 when the radio is off,
+ * and -1 when the window does not apply -- no window configured, or the board
+ * has joined a network and its radio is carrying data. */
+void netmgr_ap_reopen(void);
+int  netmgr_ap_window_left_s(void);
+
+/* Override the window and leave the radio up for good. Persisted.
+ *
+ * For a bench, and for the rare site that wants the page always reachable.
+ * It is a real decision, not a convenience: an open, unauthenticated access
+ * point broadcasting permanently in a customer's building is the thing the
+ * window exists to avoid, so the page says so plainly rather than offering
+ * this as a neutral checkbox. No effect on a board that has joined a network
+ * -- its radio is carrying data and was never going to be switched off. */
+bool      netmgr_ap_always_on(void);
+esp_err_t netmgr_set_ap_always_on(bool on);
+
 esp_err_t netmgr_factory_reset(void);
 
 /* Dotted-quad of the current address, or "0.0.0.0". For the status page. */

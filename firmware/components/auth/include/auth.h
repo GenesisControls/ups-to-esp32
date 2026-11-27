@@ -28,6 +28,15 @@ uint32_t auth_src_of_fd(int fd);
 
 esp_err_t auth_init(void);                  /* load from NVS; call after nvs_flash_init */
 bool auth_enabled(void);
+
+/* True while the login is still the compiled-in default that auth_init()
+ * seeded (CONFIG_UPSA_DEFAULT_ADMIN_USER / _PASS), rather than one somebody
+ * chose. The web page shows a notice while this holds, and clears it by
+ * calling auth_set_credentials(). Always false when no default is built in.
+ *
+ * A NOTICE, NOT A GATE: nothing is refused because the default is still in
+ * use. A board that is never reconfigured must keep working. */
+bool auth_is_default(void);
 /* The stored username into out; false if there is no login. */
 bool auth_username(char *out, size_t cap);
 

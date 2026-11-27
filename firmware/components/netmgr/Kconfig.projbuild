@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+menu "My UPS Pal setup access point"
+
+config UPSA_AP_WINDOW_S
+    int "Seconds the setup AP stays up with nobody on it (0: for ever)"
+    default 0
+    range 0 86400
+    help
+        0 is the upstream behaviour and the default: the setup access point
+        stays up until the board joins a network. Right when the board is
+        useless until it does.
+
+        Set it, and a board that has not joined a network keeps its access
+        point for this long and then turns the radio OFF -- not a hidden
+        SSID, off. The clock restarts whenever a client is associated, so it
+        never closes under someone's feet while they are configuring it, and
+        it restarts again on every press of BOOT.
+
+        For this adapter the UPS data goes out over RS485 and the radio exists
+        only so a technician can open the page. Leaving an open access point
+        broadcasting for years in twenty customer buildings is a standing
+        invitation; ten minutes after power-up is enough to configure a board.
+
+        THE WAY BACK IS PHYSICAL, by design: press BOOT, or power-cycle the
+        board, and the window starts again. Both are available to anyone who
+        can reach the board, and neither needs the network that is off.
+
+        A board that HAS joined a network is never touched by this: its radio
+        is carrying data.
+
+endmenu

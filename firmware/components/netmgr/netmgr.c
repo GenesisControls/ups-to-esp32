@@ -565,6 +565,99 @@ static esp_netif_t *create_sta(bool lan)
     return n;
 }
 
+/* ---- The setup AP's window ---------------------------------------------
+ *
+ * See netmgr.h. Off by default (CONFIG_UPSA_AP_WINDOW_S 0), which is exactly
+ * what upstream does today.
+ *
+ * The station list is polled rather than hooked: netmgr handles no
+ * WIFI_EVENT_AP_STA* events at all today, and a ten-second poll of
+ * esp_wifi_ap_get_sta_list() answers the only question here -- is anyone on
+ * it -- without adding event-ordering to the setup path.
+ */
+static esp_timer_handle_t s_ap_timer;
+static int64_t            s_ap_deadline_us;
+static bool               s_ap_closed;
+static bool               s_ap_always;    /* window overridden: stay up */
+
+static int64_t ap_window_us(void)
+{
+    return (int64_t)CONFIG_UPSA_AP_WINDOW_S * 1000000;
+}
+
+static void ap_window_cb(void *arg)
+{
+    (void)arg;
+    /* A board that joined a network is carrying data on its radio. The window
+     * is only ever about the setup AP of a board that has not. */
+    if (s_state != NETMGR_AP_PROVISIONING || s_ap_closed || s_ap_always) return;
+
+    wifi_sta_list_t sl;
+    if (esp_wifi_ap_get_sta_list(&sl) == ESP_OK && sl.num > 0) {
+        /* Somebody is on it. Hold it open, and keep holding while they stay,
+         * so it cannot close under a technician mid-configuration. */
+        s_ap_deadline_us = esp_timer_get_time() + ap_window_us();
+        return;
+    }
+    if (esp_timer_get_time() < s_ap_deadline_us) return;
+
+    ESP_LOGW(TAG, "setup AP idle for %ds: turning the radio off. "
+                  "Press BOOT or power-cycle the board to bring it back.",
+             CONFIG_UPSA_AP_WINDOW_S);
+    s_ap_closed = true;
+    esp_err_t e = esp_wifi_stop();
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "could not stop Wi-Fi: %s", esp_err_to_name(e));
+        s_ap_closed = false;        /* still up; try again next tick */
+    }
+}
+
+void netmgr_ap_reopen(void)
+{
+    if (ap_window_us() <= 0) return;             /* no window: nothing to do */
+    s_ap_deadline_us = esp_timer_get_time() + ap_window_us();
+    if (!s_ap_closed) return;                    /* up already; clock restarted */
+
+    s_ap_closed = false;
+    esp_err_t e = esp_wifi_start();
+    ESP_LOGW(TAG, "setup AP reopened for %ds (%s)",
+             CONFIG_UPSA_AP_WINDOW_S, esp_err_to_name(e));
+}
+
+bool netmgr_ap_always_on(void) { return s_ap_always; }
+
+esp_err_t netmgr_set_ap_always_on(bool on)
+{
+    nvs_handle_t h;
+    esp_err_t e = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (e != ESP_OK) return e;
+    nvs_set_u8(h, "ap_always", on ? 1 : 0);
+    e = nvs_commit(h);
+    nvs_close(h);
+    if (e != ESP_OK) return e;
+    s_ap_always = on;
+    if (on) {
+        /* Takes effect at once, in both directions: switching it on brings a
+         * closed radio straight back rather than making someone power-cycle
+         * to use the switch they just set. */
+        netmgr_ap_reopen();
+        ESP_LOGW(TAG, "setup AP will stay up indefinitely (window overridden)");
+    } else {
+        s_ap_deadline_us = esp_timer_get_time() + ap_window_us();
+        ESP_LOGI(TAG, "setup AP window back on: %ds", CONFIG_UPSA_AP_WINDOW_S);
+    }
+    return ESP_OK;
+}
+
+int netmgr_ap_window_left_s(void)
+{
+    if (ap_window_us() <= 0 || s_ap_always) return -1;
+    if (s_state != NETMGR_AP_PROVISIONING) return -1;
+    if (s_ap_closed) return 0;
+    int64_t left = (s_ap_deadline_us - esp_timer_get_time()) / 1000000;
+    return left < 0 ? 0 : (int)left;
+}
+
 /* Open network, on purpose. A WPA2 passphrase on a setup AP has to be printed
  * on the board or the manual, which means it is public anyway, and it stops a
  * phone joining automatically. Nothing here is worth protecting for the couple
@@ -601,10 +694,36 @@ static void start_softap(void)
 
     ESP_LOGI(TAG, "provisioning AP \"%s\" up -- join it and open http://192.168.4.1/",
              s_ap_ssid);
+
+    if (ap_window_us() > 0) {
+        s_ap_deadline_us = esp_timer_get_time() + ap_window_us();
+        const esp_timer_create_args_t ap_args = {
+            .callback = ap_window_cb, .name = "ap_window",
+        };
+        if (esp_timer_create(&ap_args, &s_ap_timer) == ESP_OK &&
+            esp_timer_start_periodic(s_ap_timer, 10LL * 1000000) == ESP_OK) {
+            ESP_LOGI(TAG, "the AP turns off after %ds with no client; "
+                          "BOOT or a power cycle brings it back",
+                     CONFIG_UPSA_AP_WINDOW_S);
+        } else {
+            /* Leaving it up for ever is the safe failure: a board nobody can
+             * reach is worse than a radio that stayed on. */
+            ESP_LOGE(TAG, "could not arm the AP window; the AP will stay up");
+        }
+    }
 }
 
 esp_err_t netmgr_start(void)
 {
+    {   /* Read before the AP comes up, so its window is armed correctly the
+         * first time rather than closing once and then being overridden. */
+        nvs_handle_t nh;
+        if (nvs_open(NVS_NS, NVS_READONLY, &nh) == ESP_OK) {
+            uint8_t v = 0;
+            if (nvs_get_u8(nh, "ap_always", &v) == ESP_OK) s_ap_always = v != 0;
+            nvs_close(nh);
+        }
+    }
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     netmgr_ip6_init();

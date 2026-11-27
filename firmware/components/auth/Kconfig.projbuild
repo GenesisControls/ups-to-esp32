@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+menu "My UPS Pal login"
+
+config UPSA_DEFAULT_ADMIN_USER
+    string "Default admin username (empty: no default login)"
+    default ""
+    help
+        Seeded into NVS by auth_init() on a board that has no login stored,
+        so the board is usable the moment it powers up and the setup page does
+        not have to insist on a login before it will do anything.
+
+        EMPTY IS THE UPSTREAM BEHAVIOUR and the default: no login exists until
+        someone chooses one, and the setup form requires it. Leave it empty
+        unless a deployment has a reason to ship a known login.
+
+        A default set here is compiled into the image, and under GPL the
+        corresponding source goes to whoever receives that image -- so treat
+        anything set here as public. A per-device default derived from the MAC
+        is stronger if you can label the boards.
+
+config UPSA_DEFAULT_ADMIN_PASS
+    string "Default admin password"
+    default ""
+    help
+        Used only when UPSA_DEFAULT_ADMIN_USER is set. 8-64 characters, no
+        spaces or quotes (authc_shape_ok). Stored salted and hashed like any
+        other password; only this build-time string is plain text.
+
+        While the login is still this default, auth_is_default() is true and
+        the web page says so. It is a notice, not a gate: nothing is blocked.
+
+endmenu

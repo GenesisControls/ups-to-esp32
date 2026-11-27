@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Espressif's Modbus stack, from the ESP Component Registry. Apache-2.0,
+# which is compatible with this firmware's GPL-3.0-or-later.
+#
+# ON THE 2.x LINE, deliberately, and the reason is a requirement rather than
+# a preference. 1.x keeps ONE global slave instance:
+#
+#     static mb_slave_interface_t* slave_interface_ptr = NULL;
+#
+# set by mbc_slave_init(), so a second init overwrites the first and an RTU
+# slave and a TCP slave cannot coexist. This adapter has to serve Modbus RTU
+# on the RS485 trunk and Modbus TCP over Wi-Fi AT THE SAME TIME, which 1.x
+# simply cannot do.
+#
+# 2.0 reworked exactly that: mbc_slave_init() became mbc_slave_create_serial()
+# and mbc_slave_create_tcp(), each returning a handle, because supporting
+# multiple instances was the point of the rework. Our out_modbus.c is written
+# against that handle-based API and will NOT compile against 1.x.
+#
+# Pinned to ^2.1 rather than left open: the 1.x -> 2.x move was a silent
+# source-level break, and a 3.x would be the next one.
+dependencies:
+  espressif/esp-modbus: "^2.1"

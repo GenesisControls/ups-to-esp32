@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+menu "My UPS Pal web page"
+
+config UPSA_SETUP_SCREEN
+    bool "Show the guided Wi-Fi setup screen on a board with no network"
+    default y
+    help
+        With this on (the upstream behaviour), a board that has not joined a
+        network shows nothing but the Wi-Fi card: the menu, the status and
+        every other card are hidden until it joins one. That is right when the
+        network IS the product -- the board is useless until it is on one.
+
+        Turn it OFF for a board whose network is optional. This adapter sends
+        its UPS data over RS485 and most units never join a Wi-Fi at all; the
+        radio exists so a technician can open the page. Leaving the guided
+        screen on would leave those boards behind a Wi-Fi form for their whole
+        service life, with no way to reach anything else.
+
+        Off, the page comes up normally on the board's own access point and
+        Wi-Fi is one ordinary card among the others, there if it is wanted.
+
+endmenu

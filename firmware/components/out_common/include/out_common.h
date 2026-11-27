@@ -1,0 +1,403 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * The Genesis point set: one place that turns ups_data_t into the numbers
+ * Niagara reads, so Modbus and BACnet cannot drift apart.
+ *
+ * WHY THIS EXISTS. Two outputs (out_modbus, out_bacnet) publish the same
+ * facts, and a second track -- the Windows NUT + pymodbus bridge in
+ * ups-modbus-monitoring -- publishes them too, to the same Niagara point
+ * sheet. Three renderings of one contract is three chances to disagree about
+ * what 65535 means or which bit is "on battery". So the contract lives here,
+ * once, with no I/O in it, and the outputs only format what this produces.
+ *
+ * THE OTHER TRACK OWNS THE NUMBERING. ups-modbus-monitoring/README.md, under
+ * "The map", is authoritative: addresses, units, the status bitfield's width
+ * and the comm-loss behaviour. Registers 0-7 are already wired into Niagara
+ * at live sites. Do not change them here; change them there, with that track,
+ * or both halves of the fleet disagree.
+ *
+ * Address space, signed off 2026-11-20:
+ *   discretes 0-10    the UPS's state
+ *   registers 0-7     the original points, LIVE at sites today
+ *   registers 8-15    facts about the UPS      (12-15 reserved)
+ *   registers 16-23   facts about the adapter  (19-23 reserved)
+ */
+#ifndef GENESIS_OUT_COMMON_H
+#define GENESIS_OUT_COMMON_H
+
+#include <stdbool.h>
+#include <stdint.h>
+#include "esp_err.h"
+
+#define OUT_DISCRETE_N  11      /* 0..10  */
+#define OUT_REG_N       24      /* 0..23  */
+
+/* "Not reported by this UPS", or "comm lost". Real measurements are clamped
+ * to OUT_REG_MAX_REAL so this value can never be mistaken for one. */
+#define OUT_ABSENT      65535u
+#define OUT_REG_MAX_REAL 65534u
+
+/* THESE TWO ARE ADDRESSES, NOT CHOICES, so they start at 0 and stay there.
+ * Modbus addressing is 0-based and the other track's map fixes every one of
+ * them; renumbering would move every point at every commissioned site. The
+ * from-1 rule above applies to enums we are free to number. */
+enum {                          /* discrete inputs (FC2), mirrored as coils  */
+    OUT_D_ONLINE = 0,
+    OUT_D_ON_BATTERY,           /* the one every site alarms on              */
+    OUT_D_LOW_BATTERY,
+    OUT_D_REPLACE_BATTERY,
+    OUT_D_OVERLOAD,
+    OUT_D_COMM_OK,
+    OUT_D_AVR_BOOST,
+    OUT_D_AVR_TRIM,
+    OUT_D_CHARGING,
+    OUT_D_BATTERY_AGE_ALARM,
+    OUT_D_OUTPUT_NOT_PROTECTING, /* OFF or BYPASS: the load is NOT on the UPS */
+};
+
+enum {                          /* input registers (FC4), mirrored as holding */
+    OUT_R_CHARGE_PCT = 0,
+    OUT_R_RUNTIME_S,
+    OUT_R_LOAD_PCT,
+    OUT_R_INPUT_V10,
+    OUT_R_OUTPUT_V10,
+    OUT_R_BATTERY_V10,
+    OUT_R_HEARTBEAT,
+    OUT_R_STATUS_BITS,          /* bits 0-5 ONLY -- see the note below        */
+    OUT_R_BATTERY_AGE_D,
+    OUT_R_TEST_RESULT,
+    OUT_R_TRANSFER_LOW_V10,
+    OUT_R_TRANSFER_HIGH_V10,
+    /* 12: the UPS's own alarm. 1 disabled, 2 enabled, 3 muted -- the
+     * AudibleAlarmControl values, already 1-based, so the number is the same
+     * on both protocols with no renumbering.
+     *
+     * "Enabled" means the beeper is ALLOWED to sound, not that it is sounding.
+     * No UPS here reports "beeping right now": the status word is
+     * OL/OB/LB/CHRG/DISCHRG/RB/OVER and carries no alarm bit. What makes it
+     * sound is already on the bus as discretes 1-4.
+     *
+     * CLAIMED FROM THE RESERVED 12-15 RANGE on 2026-11-23. That range belongs
+     * to the shared map and the brief says not to take one without going
+     * through the other track -- this needs relaying, not assuming. */
+    OUT_R_BEEPER,
+    /* 13: what the UPS is DOING, in one point -- see out_common.c for how it
+     * is decided and why "on battery" beats a running test. Claimed from the
+     * reserved range on 2026-11-23 alongside 12; both need relaying. */
+    OUT_R_UPS_STATE,
+    /* 14-15 reserved for further UPS facts */
+    OUT_R_FW_VERSION = 16,
+    OUT_R_RESET_COUNT,
+    OUT_R_RESET_REASON,
+    /* 19-23 reserved for further adapter facts */
+};
+
+/* Register 13's states. 1-based, like every enumeration here, so the number
+ * is the same on Modbus and BACnet.
+ *
+ * NORMAL is deliberately the only "nothing to see here" value: every case
+ * the rules below do not cover lands on UNKNOWN rather than on NORMAL,
+ * because a summary point that reports calm when it cannot tell is the one
+ * failure this point must not have. */
+enum {
+    OUT_STATE_NORMAL = 1,       /* online, battery idle                      */
+    OUT_STATE_SELF_TEST,        /* online AND discharging: a test, not a cut */
+    OUT_STATE_CALIBRATING,      /* the UPS reports CAL: the deep test        */
+    OUT_STATE_ON_BATTERY,       /* the mains actually failed                 */
+    OUT_STATE_NOT_PROTECTING,   /* OFF or bypass: the load is not on the UPS */
+    OUT_STATE_UNKNOWN,          /* readable, but nothing above fits          */
+};
+
+/* THE PROTOCOLS THIS FIRMWARE KNOWS BY NAME.
+ *
+ * Not "one, ever" -- that was true until 2026-11-22 and is not now. The RS485
+ * protocol is one of RTU or MS/TP, and Modbus TCP runs alongside either.
+ * OUT_PROTO_BACNET_IP is a name only: nothing serves it and
+ * out_common_set_proto() refuses it.
+ *
+ * Kept here rather than in either output so both read the same answer and
+ * neither can start while the other holds the trunk. Each output is started
+ * unconditionally from main.c, asks this, and creates no task and allocates
+ * nothing unless it is the one selected -- the pattern upstream's snmp.c
+ * already uses, so a board that never speaks BACnet pays nothing for it.
+ *
+ * The IP protocols are offered only while an interface actually has an
+ * address. NOT keyed to the board type: the brief originally said Modbus TCP
+ * and BACnet/IP were "Ethernet board only", but an RS485 board that joins a
+ * Wi-Fi can serve them perfectly well, and one site will. Ask the network,
+ * not the part number. */
+/* Numbered from 1, like every choice enum here: a zero-valued member cannot
+ * be told apart from an NVS key that was never written or a JSON field that
+ * was never sent, and both of those happen. */
+typedef enum {
+    OUT_PROTO_NONE = 1,         /* nothing on the bus; the page still works */
+    OUT_PROTO_MODBUS_RTU,       /* RS485 */
+    OUT_PROTO_BACNET_MSTP,      /* RS485 */
+    OUT_PROTO_MODBUS_TCP,       /* needs an IP address */
+    OUT_PROTO_BACNET_IP,        /* needs an IP address */
+} out_proto_t;
+
+/* WHAT RUNS: one primary protocol, plus Modbus TCP if wanted.
+ *
+ * The primary protocol is one of Modbus RTU, BACnet MS/TP or BACnet/IP, and
+ * they are mutually exclusive for two different reasons:
+ *
+ *   - RTU and MS/TP share the RS485 UART. One pair of wires, one protocol.
+ *   - MS/TP and BACnet/IP share bacnet-stack's single Datalink_Transport.
+ *     BACDL_MULTIPLE compiles several datalinks in but datalink_receive() is
+ *     a switch over one active transport, so the stack serves ONE at a time.
+ *     Serving both would mean the router/gateway pattern, which is a
+ *     different device.
+ *
+ * Strictly, Modbus RTU and BACnet/IP do not conflict with each other at all
+ * -- different stacks, different media. One selector is a little stricter
+ * than physics requires, and that is deliberate: Tobias chose it on
+ * 2026-11-22 over a conflict matrix nobody wants to explain to a technician,
+ * and a site with BACnet/IP is not also asking for Modbus on the trunk.
+ *
+ * Modbus TCP is the exception that genuinely is independent: it shares
+ * nothing with the three above except the point set, so it runs alongside any
+ * of them. That is what the esp-modbus 2.x migration was for -- 1.x kept one
+ * global slave instance, so an RTU slave and a TCP slave could not coexist
+ * however the settings were shaped.
+ *
+ * out_common was always built for several outputs at once: one shared point
+ * set, so no two of them can answer differently in the same second. */
+out_proto_t out_common_proto(void);
+esp_err_t   out_common_set_proto(out_proto_t p);
+const char *out_common_proto_name(out_proto_t p);
+
+/* Modbus TCP, alongside whatever the primary protocol is. */
+bool      out_common_tcp_enabled(void);
+esp_err_t out_common_set_tcp_enabled(bool on);
+
+/* The RS485 station address: Modbus RTU's slave address, or BACnet MS/TP's
+ * MAC. Default 4.
+ *
+ * RS485 ONLY. Modbus TCP has its own unit id below, because the two describe
+ * different networks and sharing one number forced them equal -- fine while
+ * only one output ran, wrong the moment both do. A site's trunk layout has
+ * nothing to say about what unit id its BMS puts in a TCP header.
+ *
+ * The VALID RANGE DEPENDS ON THE PROTOCOL: 1-247 for Modbus (RTU and TCP),
+ * 0-127 for a BACnet MS/TP master, since MS/TP's token passing cannot address
+ * above 127. So 200 is a legal Modbus unit ID and an illegal MS/TP MAC, and
+ * switching protocol can invalidate an address that was fine before -- which
+ * is why out_common_address_valid() takes the protocol, and why the two must
+ * be validated together rather than one after the other. Clamping silently
+ * would be worse than refusing: the BMS would still be polling the old
+ * address and the trunk would just go quiet.
+ *
+ * Two adapters at one address on one segment collide silently, so deriving a
+ * default from the MAC -- as the AP SSID already does -- is worth revisiting
+ * if these ever share a trunk. */
+#define OUT_ADDR_DEFAULT 4
+int       out_common_address(void);
+esp_err_t out_common_set_address(int addr);
+bool      out_common_address_valid(int addr, out_proto_t p);
+
+/* 0 means autobaud: listen, lock on, and re-scan after silence. Anything else
+ * is a fixed rate. Default 0. Autobaud is its own piece of work and does not
+ * exist yet, so an output seeing 0 today should fall back to 9600 and say so
+ * rather than stay silent. */
+#define OUT_BAUD_AUTO 0
+int       out_common_baud(void);
+esp_err_t out_common_set_baud(int baud);
+
+/* Serial framing on the trunk. One setting rather than separate parity and
+ * stop-bit fields: a BMS tool asks for "8N1" and the pair only has four
+ * combinations anyone uses, so splitting them would mostly offer invalid ones.
+ *
+ * 8N1 is the default and what nearly every BMS master is set to. Note that
+ * the Modbus RTU spec actually calls for TWO stop bits when there is no
+ * parity, to keep eleven bits per character -- 8N2 is here for a master that
+ * holds to that, because a device framing 8N1 against a strict 8N2 master
+ * produces frame errors that look exactly like a wrong baud rate. */
+typedef enum {
+    OUT_FMT_8N1 = 1,            /* default */
+    OUT_FMT_8E1,
+    OUT_FMT_8O1,
+    OUT_FMT_8N2,                /* what the Modbus RTU spec asks for */
+} out_fmt_t;
+
+out_fmt_t   out_common_format(void);
+esp_err_t   out_common_set_format(out_fmt_t f);
+const char *out_common_format_name(out_fmt_t f);
+
+/* ---- BACnet ------------------------------------------------------------
+ *
+ * The BACnet device object instance: what a BMS discovers this adapter as,
+ * and the number an engineer types into a JACE. Unique across the whole
+ * BACnet internetwork, not just the trunk.
+ *
+ * 0 means DERIVE IT FROM THE CHIP MAC, which is the default and deliberately
+ * so. The alternative default is a constant, and a constant means twenty
+ * adapters shipping as the same instance -- most likely 12345, which is the
+ * value in every vendor's example code and therefore the one most likely to
+ * already be taken. A derived default is unique without anyone configuring
+ * it; the override is here for a site with its own numbering plan. */
+#define OUT_DEVID_DERIVE 0
+#define OUT_DEVID_MAX    4194303u      /* ASHRAE 135: 22 bits */
+uint32_t  out_common_device_id(void);          /* as stored: 0 = derive */
+esp_err_t out_common_set_device_id(uint32_t id);
+
+/* MS/TP, and MS/TP only -- both are token-passing parameters, and BACnet/IP
+ * has no token.
+ *
+ * max info frames: how many frames this node may send while it holds the
+ * token. 1 is the standard's own default and right for a device that mostly
+ * answers; raising it helps only if we originate a lot of traffic.
+ *
+ * max master: the highest MAC the token-passing algorithm searches for.
+ * Lowering it to just above the highest address actually on the segment
+ * speeds up token rotation measurably, because the poll-for-master sweep
+ * stops there instead of walking to 127. */
+#define OUT_INFOFRAMES_DEFAULT 1
+#define OUT_MAXMASTER_DEFAULT  127
+int       out_common_info_frames(void);
+esp_err_t out_common_set_info_frames(int n);
+int       out_common_max_master(void);
+esp_err_t out_common_set_max_master(int n);
+
+/* Modbus TCP's unit id, the byte in the MBAP header. Independent of the
+ * RS485 address above.
+ *
+ * 0 MEANS "ANSWER WHATEVER THE MASTER SENDS", and is the default. esp-modbus
+ * treats a TCP slave address of 0 as a wildcard (mb_slave.c: tcp_uid_wildcard)
+ * and additionally always answers 255, the Modbus-TCP convention for "the
+ * device itself". A fixed value here is therefore a filter, not an identity,
+ * and setting one is how you get a silent socket: the BMS sends 1, the device
+ * wants 4, and nothing on either side reports a fault. Default to answering
+ * everything and let a site narrow it deliberately.
+ *
+ * 1-247 to filter; 248-255 are reserved and 0 is the wildcard. */
+#define OUT_TCP_UID_ANY 0
+int       out_common_tcp_uid(void);
+esp_err_t out_common_set_tcp_uid(int uid);
+
+/* The Modbus TCP port. Changeable because a site running two devices behind
+ * one NAT, or with its own firewall policy, has no other way out. Changing it
+ * means telling the BMS: nothing discovers a non-standard port by itself.
+ *
+ * There is deliberately no BACnet/IP port and no BACnet network number here.
+ * Both existed briefly and were read by nothing; BACnet/IP is out of scope
+ * for this board (2026-11-22), and a settings field that has no effect is
+ * worse than a missing one -- somebody eventually sets it and waits for
+ * something to happen. */
+#define OUT_MB_TCP_PORT_DEFAULT 502
+int       out_common_mb_tcp_port(void);
+esp_err_t out_common_set_mb_tcp_port(int port);
+
+/* What register 6 does when the UPS link is lost. */
+typedef enum {
+    /* 65535, matching the Python bridge's default and the handover document.
+     * Niagara sees the heartbeat stop dead with everything else. */
+    OUT_HB_INVALID = 1,
+    /* Keep counting. Lets a site tell "adapter alive, UPS link dead" from
+     * "adapter dead", which the first cannot otherwise be distinguished from.
+     * Still open with the other track; off until they agree. */
+    OUT_HB_RUN,
+} out_hb_policy_t;
+
+typedef struct {
+    bool     comm_ok;                       /* same as discrete 5            */
+    bool     discrete[OUT_DISCRETE_N];
+    uint16_t reg[OUT_REG_N];
+
+    /* Which addresses this firmware actually implements.
+     *
+     * A reserved or unimplemented address MUST NOT appear in the datastore.
+     * The other track is explicit: reading one returns Modbus exception 02,
+     * which is a different answer from 65535 and a site has to tell them
+     * apart -- 65535 says "this UPS does not report it", exception 02 says
+     * "this adapter does not have it". An output that registered 0-23 and
+     * filled the gaps with 65535 would quietly erase that distinction. */
+    bool     reg_live[OUT_REG_N];
+} out_points_t;
+
+/* Names and units for the page's register overview.
+ *
+ * Here, beside the enums, rather than in the web UI: the table a
+ * commissioning engineer reads off the screen and ticks against the Niagara
+ * point sheet must not be able to drift from the map this file implements.
+ * A reserved address has no name -- it does not exist. */
+const char *out_common_discrete_name(int i);
+const char *out_common_reg_name(int i);
+const char *out_common_reg_unit(int i);     /* "" where unitless */
+
+/* Load settings, seed the boot counter, start the 1 Hz refresh. After
+ * ups_hid_start(), like every other consumer. */
+esp_err_t out_common_init(void);
+
+/* Copy the current point set. Thread-safe; both outputs read the same
+ * snapshot, so RTU and TCP cannot answer differently in the same second. */
+void out_common_get(out_points_t *out);
+
+/* The battery's last change date, "YYYY-MM-DD", or "" to fall back to what
+ * the UPS reports in battery.mfr.date. Consumer UPSes cannot store this, so
+ * the adapter keeps it. Persisted in NVS. */
+esp_err_t out_common_set_battery_date(const char *yyyy_mm_dd);
+void      out_common_get_battery_date(char *out, size_t cap);
+
+/* Years before discrete 9 (battery age alarm) asserts. 0 disables it. */
+esp_err_t out_common_set_battery_life_years(int years);
+
+esp_err_t out_common_set_hb_policy(out_hb_policy_t p);
+out_hb_policy_t out_common_hb_policy(void);
+
+/* COMMANDS FROM THE BUS. On by default.
+ *
+ * The brief's original rule was "read-only, no UPS commands over
+ * Modbus/BACnet", reversed by Tobias on 2026-11-22 to allow a battery
+ * self-test trigger, and made the default the same day. What the rule
+ * guarded against has not gone away -- an RS485 trunk is unauthenticated, a
+ * self-test puts the site's load on battery, and a misconfigured master
+ * repeating the write would cycle the pack -- so the guards below now carry
+ * the weight the default used to. A site that wants the old behaviour clears
+ * the checkbox on the board's own page.
+ *
+ * The guards are in out_common_request_selftest() below, which is the only
+ * way in for either protocol. */
+bool      out_common_cmd_enabled(void);
+esp_err_t out_common_set_cmd_enabled(bool on);
+
+/* WHICH TEST. The UPS takes all three; until 2026-11-23 only the first
+ * reached the bus.
+ *
+ * STOP is not the opposite of a start, it is the safe one: it ends a
+ * condition rather than creating one. So it is allowed whenever either test
+ * is, and it is never rate limited -- a site that needs its battery back out
+ * of a two-hour calibration must not be told to wait twenty minutes. */
+typedef enum {
+    OUT_TEST_QUICK = 0,     /* seconds on battery                            */
+    OUT_TEST_DEEP,          /* runtime calibration: down to low battery      */
+    OUT_TEST_STOP,          /* abort whatever is running                     */
+} out_test_t;
+
+/* DEEP HAS ITS OWN OPT-IN, separate from the quick test's.
+ *
+ * A quick test is seconds on battery. A deep test is a runtime calibration:
+ * it runs the pack down to the low-battery threshold, which on a lightly
+ * loaded unit is well over an hour with the site unprotected if the mains
+ * fails meanwhile. One checkbox authorising both would have been the wrong
+ * shape for a trunk nobody authenticates. Off by default. */
+bool      out_common_deep_enabled(void);
+esp_err_t out_common_set_deep_enabled(bool on);
+
+/* Starts or stops a battery test, if everything that can refuse it agrees:
+ * this board has been opted in FOR THAT TEST, a UPS is attached, its own
+ * report descriptor says it can self-test, and the rate limit has run. The
+ * outcome is logged either way, with `via` naming what asked, so a technician
+ * reading the console learns which bus started a test.
+ *
+ * SHARED ON PURPOSE. Modbus TCP can run alongside BACnet MS/TP, so two
+ * transports can reach the same battery. The half-hour limit is a statement
+ * about the pack, not about a bus, and living here is what stops each path
+ * keeping its own -- which would have doubled the real rate the day MS/TP
+ * gained a trigger of its own.
+ *
+ * ESP_OK means the command reached the UPS. Callers count that and nothing
+ * else; every refusal is already logged here. */
+esp_err_t out_common_request_test(out_test_t which, const char *via);
+
+#endif /* GENESIS_OUT_COMMON_H */

@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS "webui.c" "metrics.c"
     INCLUDE_DIRS "include"
-    REQUIRES nvs_flash esp_http_server snmp fleet crashlog esp_timer ups_hid netmgr nut_server ota board esp_app_format app_update json auth mbedtls tailnet outagelog history tlscert esp_https_server lwip
+    REQUIRES out_common out_modbus out_bacnet nvs_flash esp_http_server snmp fleet crashlog esp_timer ups_hid netmgr nut_server ota board esp_app_format app_update json auth mbedtls tailnet outagelog history tlscert esp_https_server lwip
 )
 
 # The page is stored gzipped and served as it is, with Content-Encoding: gzip:
